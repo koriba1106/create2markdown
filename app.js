@@ -32,7 +32,6 @@
   const statRedacted = document.getElementById("statRedacted");
   const statBytes = document.getElementById("statBytes");
 
-  // 修正P1 (セクション4): ジョブとPromiseのライフサイクルを一元管理するオブジェクト
   let currentJob = null;
   let generatedMarkdown = "";
   let currentRootName = "project";
@@ -114,7 +113,6 @@
     dropTitle.textContent = statusText || "⏳ 安全に解析・処理中...";
   }
 
-  // 修正P1 (セクション4): キャンセル時に待機中のPromiseも確実にrejectしてリソースを解放
   function cancelActiveJob(reason = "JOB_CANCELLED") {
     if (!currentJob) return false;
     const job = currentJob;
@@ -128,7 +126,6 @@
     return true;
   }
 
-  // 修正P1 (セクション5-①): 非同期APIが応答しない場合でも期限・Abort時に即時脱出するラッパー
   function withAbortAndTimeout(promise, signal, deadline) {
     return new Promise((resolve, reject) => {
       if (signal.aborted) {
@@ -235,7 +232,6 @@
     return collected;
   }
 
-  // 修正P1 (セクション4): 正常完了・エラー・キャンセルで必ず一度だけSettleするWorker実行器
   function runWorkerTask(payload, transferList = [], jobContext = null) {
     return new Promise((resolve, reject) => {
       let settled = false;
@@ -320,7 +316,6 @@
       currentRootName = result.rootName || "project";
       updateStatsUI(result.stats);
 
-      // 出力前プレビューの表示（先頭10,000文字）
       const previewSlice = generatedMarkdown.slice(0, 10000);
       previewBox.value =
         previewSlice +
@@ -355,8 +350,8 @@
   }
 
   async function handleZipFile(file) {
-    if (file.size > 25 * 1024 * 1024) {
-      appendLog("❌ ZIP圧縮サイズが上限(25MB)を超えているため拒否しました。");
+    if (file.size > 50 * 1024 * 1024) {
+      appendLog("❌ ZIP圧縮サイズが上限(50MB)を超えているため拒否しました。");
       return;
     }
     const rootName = file.name.replace(/\.zip$/i, "");
@@ -380,7 +375,6 @@
     }
   }
 
-  // ドロップ＆ファイル選択イベント
   dropZone.addEventListener("dragover", (e) => {
     e.preventDefault();
     if (!currentJob) dropZone.classList.add("dragover");
@@ -515,7 +509,7 @@
   });
 
   // ===================================================================
-  // 修正P1 (セクション6): 厳格化された全12項目のセキュリティ自己診断スイート
+  // 全12項目の厳格セキュリティ自己診断スイート
   // ===================================================================
   const TEST_CRC_TABLE = (() => {
     const table = new Uint32Array(256);
@@ -668,8 +662,7 @@
       const badCrcZip = buildCustomTestZip([{ name: "corrupt.py", data: "print('hello')", customCrc: 0x12345678 }]);
       await expectReject("4. CRC-32 不一致（改ざんデータ）の検証と拒否", badCrcZip, "CRC_MISMATCH");
 
-      // テスト5: ヘッダサイズ偽装型 Deflate Zip Bomb の実展開ストリーム遮断
-      // 20KBのデータをDeflate圧縮し、ヘッダ上のuncompSizeを「64バイト」に偽装して単体上限10KBのWorkerへ投入
+      // テスト5〜11: 複合検査
       const bombPayload = new Uint8Array(20 * 1024).fill(65);
       const compressedBomb = await deflateRawBytes(bombPayload);
       const mainSuitZip = buildCustomTestZip([
@@ -678,7 +671,7 @@
           data: bombPayload,
           compressedData: compressedBomb,
           method: 8,
-          fakeUncompSize: 64 // ヘッダサイズを小さく偽装
+          fakeUncompSize: 64
         },
         { name: "../../etc/passwd.py", data: "print('zip_slip')" },
         { name: ".env.local", data: "SECRET=1" },
@@ -699,7 +692,7 @@
           options: {
             secretMode: "redact",
             includeBoundary: true,
-            customLimits: { MAX_SINGLE_FILE_BYTES: 10 * 1024 } // 単体上限 10KB で実ストリーム遮断を試験
+            customLimits: { MAX_SINGLE_FILE_BYTES: 10 * 1024 }
           }
         },
         [mainSuitZip]
@@ -769,7 +762,6 @@
       );
       const budgetPassed = budgetRes.stats.processedFiles === 2;
 
-      // キャンセルによるPromise即時reject検証
       const cancelJobCtx = { abortController: new AbortController(), cancelWorkerPromise: null };
       const dummyZip = buildCustomTestZip([{ name: "ok.py", data: "x = 1" }]);
       const pendingPromise = runWorkerTask({ mode: "zip", rootName: "cancel_test", zipBuffer: dummyZip }, [dummyZip], cancelJobCtx);
@@ -805,5 +797,5 @@
     }
   });
 
-  appendLog("🛡️ Strict Audited Edition 初期化完了 (Strict CSP / CRC-32検証 / 出力前監査プレビュー有効)");
+  appendLog("🛡️ Strict Audited Edition 初期化完了 (単体5MB / 合計50MB / Strict CSP / CRC-32検証有効)");
 })();
