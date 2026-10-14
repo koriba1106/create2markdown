@@ -1,0 +1,100 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <!--
+    Strict CSP:
+    'unsafe-inline' および外部ドメイン・blob: を完全排除し、同一オリジン('self')の静的ファイルのみを許可。
+    ※ clickjacking対策の frame-ancestors 'none' 等はHTTPレスポンスヘッダ側での付与を推奨。
+  -->
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; worker-src 'self'; connect-src 'none'; img-src 'self' data:; object-src 'none'; base-uri 'none'; form-action 'none';">
+  <title>Secure Gemini Code Packer (Strict Audited Edition)</title>
+  <link rel="stylesheet" href="./style.css">
+</head>
+<body>
+
+<div class="container">
+  <div class="header">
+    <h1>
+      Secure Gemini Code Packer
+      <span class="badge">Strict CSP / CRC-32 &amp; Stream Verified</span>
+    </h1>
+  </div>
+
+  <div class="notice-box">
+    <strong>セキュリティに関する重要事項:</strong>
+    本ツールは同一オリジン内のローカル処理のみで動作し、外部へデータを送信しません。既知パターン（APIキー、Bearerトークン、引用符なしパスワード代入、秘密鍵等）による機密検査を行いますが、<strong>すべての秘密情報の完全な検出を保証するものではありません（未検出箇所は「未検証」扱いとなります）</strong>。Geminiへ投入する前に、必ず下部のプレビュー領域で出力内容を確認してください。
+  </div>
+
+  <div class="options-bar">
+    <label>
+      機密パターン検出時の動作:
+      <select id="secretModeSelect">
+        <option value="skip" selected>ファイル全体を安全に除外する（推奨・標準）</option>
+        <option value="redact">該当箇所を [REDACTED] にマスクして出力する</option>
+      </select>
+    </label>
+    <label>
+      <input type="checkbox" id="boundaryCheck" checked>
+      未信頼データ境界宣言（プロンプトインジェクション対策）を付与
+    </label>
+  </div>
+
+  <div id="dropZone" class="drop-zone" tabindex="0" role="button" aria-label="フォルダまたはZIPファイルをドロップ">
+    <div id="dropTitle" class="drop-title">📂 ここにフォルダ または ZIPファイル をドラッグ＆ドロップ</div>
+    <div class="drop-desc">
+      制限: 走査最大10,000件 / 採用最大2,000件 / 単体1MB / 展開合計25MB / 最終出力20MB / 制限時間30秒
+    </div>
+  </div>
+
+  <input type="file" id="folderInput" webkitdirectory directory multiple class="hidden-input">
+  <input type="file" id="zipInput" accept=".zip,application/zip" class="hidden-input">
+
+  <div class="controls">
+    <button id="btnSelectFolder" class="btn" type="button">📁 フォルダ選択</button>
+    <button id="btnSelectZip" class="btn" type="button">🗜️ ZIP選択</button>
+    <button id="btnSelfTest" class="btn" type="button" title="12項目の攻撃・異常系テストを実環境で検証します">🧪 厳格セキュリティ自己診断 (12項目)</button>
+    <div class="spacer"></div>
+    <button id="btnCancel" class="btn btn-danger" type="button" disabled>🛑 キャンセル</button>
+  </div>
+
+  <div class="progress-wrap">
+    <div id="progressBar" class="progress-bar"></div>
+  </div>
+
+  <div class="stats-grid">
+    <div class="stat-item">走査エントリ: <span id="statScanned">0</span></div>
+    <div class="stat-item">採用ファイル: <span id="statFiles">0</span></div>
+    <div class="stat-item">ファイル名除外: <span id="statSecretFiles">0</span></div>
+    <div class="stat-item">本文機密除外: <span id="statContentSkipped">0</span></div>
+    <div class="stat-item">本文マスク数: <span id="statRedacted">0</span></div>
+    <div class="stat-item">出力サイズ: <span id="statBytes">0 KB</span></div>
+  </div>
+
+  <!-- 出力前プレビュー・確認セクション -->
+  <div class="preview-section">
+    <div class="preview-header">
+      <span class="section-title">出力前プレビュー＆機密監査確認（先頭 10,000 文字表示）</span>
+      <div class="action-group">
+        <label class="confirm-label">
+          <input type="checkbox" id="confirmReviewedCheck" disabled>
+          出力内容に機密情報が含まれていないことを確認しました
+        </label>
+        <button id="btnCopy" class="btn" type="button" disabled>📋 コピー</button>
+        <button id="btnDownload" class="btn btn-primary" type="button" disabled>💾 Markdown保存</button>
+      </div>
+    </div>
+    <textarea id="previewBox" class="preview-box" readonly placeholder="解析が完了すると、ここに生成されたMarkdownのプレビューが表示されます。内容を確認し、上のチェックボックスにチェックを入れるとコピー・保存が可能になります。"></textarea>
+  </div>
+
+  <div class="log-header">
+    <span class="section-title">セキュリティ監査＆処理ログ (最大300行)</span>
+    <button id="btnClearLog" class="btn btn-small" type="button">ログ消去</button>
+  </div>
+  <div id="logBox" class="log-box"></div>
+</div>
+
+<script src="./app.js"></script>
+</body>
+</html>
