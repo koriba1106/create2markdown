@@ -1,12 +1,12 @@
 "use strict";
 
 // =====================================================================
-// 1. セキュリティ制限・検査ポリシー定義
+// 1. セキュリティ制限・検査ポリシー定義 (単体5MB / 展開合計50MB / 出力40MB)
 // =====================================================================
 const DEFAULT_CONFIG = Object.freeze({
-  MAX_SINGLE_FILE_BYTES: 1 * 1024 * 1024,          // 1ファイル最大 1MB
-  MAX_TOTAL_DECOMPRESSED_BYTES: 25 * 1024 * 1024,  // スキップ分を含む総展開量上限 25MB
-  MAX_MARKDOWN_CHARS: 20 * 1024 * 1024,            // 最終Markdown文字列の最大長 (約20MB相当)
+  MAX_SINGLE_FILE_BYTES: 5 * 1024 * 1024,          // 1ファイル最大 5MB
+  MAX_TOTAL_DECOMPRESSED_BYTES: 50 * 1024 * 1024,  // スキップ分を含む総展開量上限 50MB
+  MAX_MARKDOWN_CHARS: 40 * 1024 * 1024,            // 最終Markdown文字列の最大長 (約40MB相当)
   MAX_ACCEPTED_FILES: 2000,                        // 採用ファイル数上限
   MAX_SCANNED_ENTRIES: 10000,                      // 総走査エントリ上限
   MAX_DEPTH: 25,                                   // 最大階層
@@ -44,7 +44,7 @@ const SECRET_FILENAME_PATTERNS = [
   /^\.(npmrc|pypirc|netrc|htpasswd|pgpass|aws|docker)$/i
 ];
 
-// 修正P0 (セクション3): 引用符なし代入・Bearerトークン・接続URI・JWT等を網羅した検出ルール
+// 引用符なし代入・Bearerトークン・接続URI・JWT等を網羅した検出ルール
 const SECRET_CONTENT_RULES = [
   {
     name: "Private Key Block",
@@ -85,7 +85,6 @@ const KV_SECRET_LINE_REGEX = /\b(api[_-]?key|apikey|secret[_-]?key|client[_-]?se
 
 function isSafePlaceholderValue(rawVal) {
   let v = rawVal.trim();
-  // 行末コメントや末尾カンマ・セミコロンを除去
   v = v.replace(/[;,]\s*(?:\/\/.*|#.*)?$/, "").replace(/\s+(?:\/\/|#)\s+.*$/, "").trim();
   if ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'"))) {
     v = v.slice(1, -1).trim();
@@ -93,7 +92,6 @@ function isSafePlaceholderValue(rawVal) {
   if (v.length < 4) return true;
 
   const lower = v.toLowerCase();
-  // 明らかな言語予約語・環境変数参照・型宣言・プレースホルダのみ除外
   if (/^(true|false|null|none|nil|undefined|nan|string|int|number|boolean|object|\{\}|\[.*\])$/.test(lower)) {
     return true;
   }
@@ -103,7 +101,6 @@ function isSafePlaceholderValue(rawVal) {
   if (/^(your[_-]|change[_-]?me|replace[_-]?me|todo|fixme|placeholder|<[^>]+>|\*{4,}|x{4,}|\.{3,})$/i.test(v)) {
     return true;
   }
-  // 関数呼び出しや比較式 (例: password == other)
   if (v.startsWith("=") || /^[a-zA-Z0-9_.]+\(.*\)$/.test(v)) {
     return true;
   }
@@ -114,7 +111,6 @@ function scanAndSanitizeContent(text, secretMode) {
   let detectedCount = 0;
   let sanitized = text;
 
-  // 1. 定型トークン・秘密鍵・URI・Bearer検査
   for (const rule of SECRET_CONTENT_RULES) {
     rule.regex.lastIndex = 0;
     const matches = sanitized.match(rule.regex);
@@ -128,7 +124,6 @@ function scanAndSanitizeContent(text, secretMode) {
     }
   }
 
-  // 2. 引用符あり・なし両対応の Key-Value 秘密情報検査
   KV_SECRET_LINE_REGEX.lastIndex = 0;
   sanitized = sanitized.replace(KV_SECRET_LINE_REGEX, (fullMatch, keyName, rawVal) => {
     if (isSafePlaceholderValue(rawVal)) {
@@ -171,7 +166,7 @@ function computeCrc32(uint8Array) {
 }
 
 // =====================================================================
-// 3. 修正P0 (セクション2): 厳密なZIP構造・境界・整合性・重複検証パーサー
+// 3. 厳密なZIP構造・境界・整合性・重複検証パーサー
 // =====================================================================
 function parseAndValidateZipStructure(buffer, limits) {
   const view = new DataView(buffer);
@@ -213,7 +208,7 @@ function parseAndValidateZipStructure(buffer, limits) {
     throw new Error(`ZIP内の総エントリ数(${totalEntries}件)が安全上限(${limits.MAX_SCANNED_ENTRIES}件)を超えています。`);
   }
 
-  // 問題①対応: Central Directory の終端が EOCD の開始位置を超えないことを厳密に検証
+  // Central Directory の終端が EOCD の開始位置を超えないことを厳密に検証
   const cdEnd = cdOffset + cdSize;
   if (!Number.isSafeInteger(cdEnd) || cdOffset < 0 || cdSize < 0 || cdEnd > eocdOffset) {
     throw new Error("ZIPのCentral Directory領域がEOCD境界を超えているか破損しています。");
@@ -248,7 +243,6 @@ function parseAndValidateZipStructure(buffer, limits) {
       throw new Error("Central Directoryエントリの可変長フィールドが宣言領域(cdEnd)を超えています。");
     }
 
-    // 暗号化や未対応ビットフラグの拒否 (許可: bit 3 = Data Descriptor, bit 11 = UTF-8)
     if ((flags & ~0x0808) !== 0) {
       throw new Error(`未対応または暗号化されたZIPビットフラグ(0x${flags.toString(16)})を検出しました。`);
     }
@@ -282,12 +276,11 @@ function parseAndValidateZipStructure(buffer, limits) {
     ptr = entryEnd;
   }
 
-  // 問題①対応: 走査完了位置が宣言されたCentral Directory終端と完全一致することを検証
   if (ptr !== cdEnd) {
     throw new Error("Central Directoryの実サイズと宣言サイズ(cdSize)が一致しません。");
   }
 
-  // 3. 問題②対応: ローカルヘッダ(LFH)との完全整合性検証 ＆ エントリ領域の重複(Overlap)検査
+  // 3. ローカルヘッダ(LFH)との完全整合性検証 ＆ エントリ領域の重複(Overlap)検査
   const offsetSorted = entries.slice().sort((a, b) => a.localHeaderOffset - b.localHeaderOffset);
   let prevRegionEnd = 0;
 
@@ -315,7 +308,6 @@ function parseAndValidateZipStructure(buffer, limits) {
       throw new Error(`ローカルヘッダとCentral Directoryの属性が矛盾しています (${entry.name})。`);
     }
 
-    // Data Descriptor (bit 3) が無効な場合は LFH 側の CRC32 / サイズも完全一致を要求
     if ((entry.flags & 0x0008) === 0) {
       if (lfhCrc32 !== entry.crc32 || lfhCompSize !== entry.compSize || lfhUncompSize !== entry.uncompSize) {
         throw new Error(`ローカルヘッダとCentral DirectoryのサイズまたはCRC-32が矛盾しています (${entry.name})。`);
@@ -328,7 +320,6 @@ function parseAndValidateZipStructure(buffer, limits) {
       throw new Error(`エントリデータ領域がCentral Directory境界を超えています (${entry.name})。`);
     }
 
-    // ファイル名の一致検証
     const lfhNameBytes = new Uint8Array(buffer, lhOffset + 30, lfhNameLen);
     let lfhName;
     try {
@@ -411,12 +402,10 @@ async function extractAndVerifyZipEntry(buffer, entry, limits, budgetTracker, de
     throw new Error(`未対応の圧縮メソッド(${entry.method})`);
   }
 
-  // 宣言された展開サイズと実展開サイズの厳密な一致確認
   if (decompressedBytes.byteLength !== entry.uncompSize) {
     throw new Error(`SIZE_MISMATCH: 宣言サイズ(${entry.uncompSize}B)と実展開サイズ(${decompressedBytes.byteLength}B)が一致しません。`);
   }
 
-  // 問題②対応: CRC-32 完全照合
   const actualCrc32 = computeCrc32(decompressedBytes);
   if (actualCrc32 !== (entry.crc32 >>> 0)) {
     throw new Error(`CRC_MISMATCH: CRC-32検証に失敗しました（データ破損または改ざん）。`);
@@ -485,8 +474,7 @@ function getSafeCodeFence(content) {
   return "`".repeat(maxLen + 1);
 }
 
-// 修正P2 (セクション7): CommonMark仕様に完全準拠したインラインコードスパン生成
-// バッククォートを含むパス名でも (最大連長+1) 個のバッククォートと空白パディングで確実に保護
+// CommonMark仕様準拠のインラインコードスパン生成
 function formatCommonMarkCodeSpan(rawText) {
   const clean = String(rawText).replace(/[\r\n\t]/g, " ");
   const matches = clean.match(/`+/g);
@@ -592,7 +580,6 @@ self.onmessage = async (e) => {
 
   try {
     if (mode === "zip") {
-      // 1. 構造・境界・LFH整合性・重複の厳密検査
       const entries = parseAndValidateZipStructure(zipBuffer, limits);
       entries.sort((a, b) => a.name.localeCompare(b.name));
 
@@ -675,7 +662,7 @@ self.onmessage = async (e) => {
 
         const byteLen = rawBytes.byteLength;
         const rawText = decodeBufferSafely(rawBytes);
-        rawBytes = null; // 早期メモリ解放
+        rawBytes = null;
 
         const scanRes = scanAndSanitizeContent(rawText, secretMode);
         if (scanRes.blocked) {
@@ -821,7 +808,7 @@ self.onmessage = async (e) => {
     );
 
     const finalMarkdown = headerChunks.join("") + fileSectionChunks.join("");
-    fileSectionChunks.length = 0; // チャンク配列を即時解放
+    fileSectionChunks.length = 0;
     stats.estimatedTokens = stats.totalBytes > 0 ? Math.max(1, Math.floor(stats.totalBytes / 3.5)) : 0;
 
     self.postMessage({
