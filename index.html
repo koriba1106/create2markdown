@@ -6,7 +6,6 @@
   <!--
     Strict CSP:
     'unsafe-inline' および外部ドメイン・blob: を完全排除し、同一オリジン('self')の静的ファイルのみを許可。
-    ※ clickjacking対策の frame-ancestors 'none' 等はHTTPレスポンスヘッダ側での付与を推奨。
   -->
   <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; worker-src 'self'; connect-src 'none'; img-src 'self' data:; object-src 'none'; base-uri 'none'; form-action 'none';">
   <title>Secure Gemini Code Packer (Strict Audited Edition)</title>
@@ -44,7 +43,7 @@
   <div id="dropZone" class="drop-zone" tabindex="0" role="button" aria-label="フォルダまたはZIPファイルをドロップ">
     <div id="dropTitle" class="drop-title">📂 ここにフォルダ または ZIPファイル をドラッグ＆ドロップ</div>
     <div class="drop-desc">
-      制限: 走査最大10,000件 / 採用最大2,000件 / 単体1MB / 展開合計25MB / 最終出力20MB / 制限時間30秒
+      制限: 走査最大10,000件 / 採用最大2,000件 / 単体5MB / 展開合計50MB / 最終出力40MB / 制限時間30秒
     </div>
   </div>
 
