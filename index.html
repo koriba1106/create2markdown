@@ -3,95 +3,149 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <!--
-    Strict CSP:
-    'unsafe-inline' および外部ドメイン・blob: を完全排除し、同一オリジン('self')の静的ファイルのみを許可。
-  -->
+  <!-- Strict CSP: 外部通信・インラインスクリプト・インラインスタイルを完全遮断 -->
   <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; worker-src 'self'; connect-src 'none'; img-src 'self' data:; object-src 'none'; base-uri 'none'; form-action 'none';">
-  <title>Secure Gemini Code Packer (Strict Audited Edition)</title>
+  <title>Secure Gemini Code Packer</title>
   <link rel="stylesheet" href="./style.css">
 </head>
 <body>
 
-<div class="container">
-  <div class="header">
-    <h1>
-      Secure Gemini Code Packer
-      <span class="badge">Strict CSP / CRC-32 &amp; Stream Verified</span>
-    </h1>
-  </div>
+<!-- Clickjacking 検知時に表示されるブロック画面 (style.css の .frame-blocked を適用) -->
+<div id="frameBlocked" class="frame-blocked" hidden>
+  ⚠️ セキュリティ保護のため、フレーム（iframe）内での実行はブロックされました。直接ウィンドウで開いてください。
+</div>
 
-  <div class="notice-box">
-    <strong>セキュリティに関する重要事項:</strong>
-    本ツールは同一オリジン内のローカル処理のみで動作し、外部へデータを送信しません。既知パターン（APIキー、Bearerトークン、引用符なしパスワード代入、秘密鍵等）による機密検査を行いますが、<strong>すべての秘密情報の完全な検出を保証するものではありません（未検出箇所は「未検証」扱いとなります）</strong>。Geminiへ投入する前に、必ず下部のプレビュー領域で出力内容を確認してください。
-  </div>
-
-  <div class="options-bar">
-    <label>
-      機密パターン検出時の動作:
-      <select id="secretModeSelect">
-        <option value="skip" selected>ファイル全体を安全に除外する（推奨・標準）</option>
-        <option value="redact">該当箇所を [REDACTED] にマスクして出力する</option>
-      </select>
-    </label>
-    <label>
-      <input type="checkbox" id="boundaryCheck" checked>
-      未信頼データ境界宣言（プロンプトインジェクション対策）を付与
-    </label>
-  </div>
-
-  <div id="dropZone" class="drop-zone" tabindex="0" role="button" aria-label="フォルダまたはZIPファイルをドロップ">
-    <div id="dropTitle" class="drop-title">📂 ここにフォルダ または ZIPファイル をドラッグ＆ドロップ</div>
-    <div class="drop-desc">
-      制限: 走査最大10,000件 / 採用最大2,000件 / 単体5MB / 展開合計50MB / 最終出力40MB / 制限時間30秒
-    </div>
-  </div>
-
-  <input type="file" id="folderInput" webkitdirectory directory multiple class="hidden-input">
-  <input type="file" id="zipInput" accept=".zip,application/zip" class="hidden-input">
-
-  <div class="controls">
-    <button id="btnSelectFolder" class="btn" type="button">📁 フォルダ選択</button>
-    <button id="btnSelectZip" class="btn" type="button">🗜️ ZIP選択</button>
-    <button id="btnSelfTest" class="btn" type="button" title="12項目の攻撃・異常系テストを実環境で検証します">🧪 厳格セキュリティ自己診断 (12項目)</button>
-    <div class="spacer"></div>
-    <button id="btnCancel" class="btn btn-danger" type="button" disabled>🛑 キャンセル</button>
-  </div>
-
-  <div class="progress-wrap">
-    <div id="progressBar" class="progress-bar"></div>
-  </div>
-
-  <div class="stats-grid">
-    <div class="stat-item">走査エントリ: <span id="statScanned">0</span></div>
-    <div class="stat-item">採用ファイル: <span id="statFiles">0</span></div>
-    <div class="stat-item">ファイル名除外: <span id="statSecretFiles">0</span></div>
-    <div class="stat-item">本文機密除外: <span id="statContentSkipped">0</span></div>
-    <div class="stat-item">本文マスク数: <span id="statRedacted">0</span></div>
-    <div class="stat-item">出力サイズ: <span id="statBytes">0 KB</span></div>
-  </div>
-
-  <!-- 出力前プレビュー・確認セクション -->
-  <div class="preview-section">
-    <div class="preview-header">
-      <span class="section-title">出力前プレビュー＆機密監査確認（先頭 10,000 文字表示）</span>
-      <div class="action-group">
-        <label class="confirm-label">
-          <input type="checkbox" id="confirmReviewedCheck" disabled>
-          出力内容に機密情報が含まれていないことを確認しました
-        </label>
-        <button id="btnCopy" class="btn" type="button" disabled>📋 コピー</button>
-        <button id="btnDownload" class="btn btn-primary" type="button" disabled>💾 Markdown保存</button>
+<div id="appRoot" class="app">
+  <header>
+    <div class="brand">
+      <div class="mark" aria-hidden="true">📦</div>
+      <div>
+        <h1>Gemini Code Packer by 武庫</h1>
+        <p>ローカル完結・機密自動検査・省メモリ設計のLLM用コード変換ツール</p>
       </div>
     </div>
-    <textarea id="previewBox" class="preview-box" readonly placeholder="解析が完了すると、ここに生成されたMarkdownのプレビューが表示されます。内容を確認し、上のチェックボックスにチェックを入れるとコピー・保存が可能になります。"></textarea>
+    <div class="header-actions">
+      <button id="btnSelfTest" class="subtle" type="button">🧪 セキュリティ自己診断 (12項目)</button>
+      <button id="btnClearMemory" class="subtle" type="button" disabled>🧹 メモリ解放・クリア</button>
+    </div>
+  </header>
+
+  <div class="steps" aria-label="利用ステップ">
+    <span class="step">1. フォルダ / ZIP を選択</span>
+    <span class="step">2. プレビューと除外ログを確認</span>
+    <span class="step">3. コピーまたはMarkdown保存</span>
   </div>
 
-  <div class="log-header">
-    <span class="section-title">セキュリティ監査＆処理ログ (最大300行)</span>
-    <button id="btnClearLog" class="btn btn-small" type="button">ログ消去</button>
-  </div>
-  <div id="logBox" class="log-box"></div>
+  <main class="layout">
+    <!-- 左カラム：ファイル投入 ＆ 出力プレビュー -->
+    <section class="panel" aria-labelledby="panelInputTitle">
+      <div class="panel-head">
+        <h2 id="panelInputTitle">対象ファイルの読み込み・プレビュー</h2>
+        <span id="statBadge" class="badge">待機中</span>
+      </div>
+
+      <div id="dropZone" class="file-zone" tabindex="0" role="button" aria-label="フォルダまたはZIPファイルをドロップして選択">
+        <span id="dropTitle">📂 フォルダ または ZIPファイル をここにドロップ</span>
+        <small>上限: 走査10,000件 / 採用2,000件 / 単体5MB / 合計50MB / 出力40MB</small>
+        <input type="file" id="folderInput" webkitdirectory directory multiple tabindex="-1">
+        <input type="file" id="zipInput" accept=".zip,application/zip" tabindex="-1">
+      </div>
+
+      <p id="metaInfo" class="meta">
+        まだファイルが読み込まれていません。下のボタンまたはドラッグ＆ドロップで開始してください。
+      </p>
+
+      <div class="preview" aria-live="polite">
+        <div id="emptyState" class="empty">
+          <strong>プレビュー待機中</strong>
+          <span>解析が完了すると、ここに生成されたMarkdownの先頭プレビュー（最大10,000文字）が表示されます。</span>
+        </div>
+        <pre id="previewBox" class="test-box" hidden></pre>
+      </div>
+
+      <p class="hint">
+        ※ メモリ保護のため、プレビュー表示は先頭 10,000 文字に制限されています（保存・コピー時は全文が出力されます）。
+      </p>
+    </section>
+
+    <!-- 右カラム：設定・操作・監査ログ -->
+    <aside class="panel" aria-labelledby="panelControlTitle">
+      <div class="panel-head">
+        <h2 id="panelControlTitle">セキュリティ設定・出力操作</h2>
+      </div>
+
+      <div class="controls">
+        <!-- ファイル選択ボタン群 -->
+        <div class="field">
+          <span class="field-title">入力ソースを選択</span>
+          <div class="button-row">
+            <button id="btnSelectFolder" class="secondary" type="button">📁 フォルダ選択</button>
+            <button id="btnSelectZip" class="secondary" type="button">🗜️ ZIP選択</button>
+            <button id="btnCancel" class="subtle" type="button" disabled>🛑 中断</button>
+          </div>
+        </div>
+
+        <!-- 機密検出モード設定 -->
+        <div class="field">
+          <div class="field-header">
+            <label for="secretModeSelect">機密パターン検出時の動作</label>
+            <span class="badge">保護</span>
+          </div>
+          <select id="secretModeSelect">
+            <option value="skip" selected>ファイルごと安全に除外する（推奨）</option>
+            <option value="redact">該当箇所を [REDACTED] にマスクする</option>
+          </select>
+          <small>APIキー、秘密鍵、Bearerトークン、パスワード代入等を自動検査します。</small>
+        </div>
+
+        <!-- 境界宣言オプション -->
+        <div class="field">
+          <label for="boundarySelect">プロンプトインジェクション対策</label>
+          <select id="boundarySelect">
+            <option value="on" selected>未信頼データ境界宣言を付与する（推奨）</option>
+            <option value="off">付与しない</option>
+          </select>
+          <small>コード内のコメントがAIへのシステム命令として誤認されるのを防ぎます。</small>
+        </div>
+
+        <!-- ステータス表示 -->
+        <div id="statusBox" class="status" role="status" aria-live="polite">
+          🛡️ 準備完了（外部通信なし・完全ローカル処理）
+        </div>
+
+        <!-- 最終確認と出力アクション -->
+        <div class="field">
+          <label for="confirmReviewedCheck">
+            <input type="checkbox" id="confirmReviewedCheck" disabled>
+            プレビューを確認し、機密情報が含まれないことを確認しました
+          </label>
+        </div>
+
+        <div class="action-stack">
+          <button id="btnDownload" class="primary" type="button" disabled>💾 Markdownファイルを保存 (.md)</button>
+          <button id="btnCopy" class="secondary" type="button" disabled>📋 クリップボードにコピー</button>
+        </div>
+
+        <!-- 監査ログ・自己診断結果（内容がある時のみ表示） -->
+        <div id="logSection" class="field" hidden>
+          <div class="field-header">
+            <span class="field-title">監査＆セキュリティログ</span>
+            <button id="btnClearLog" class="subtle" type="button">消去</button>
+          </div>
+          <div id="logBox" class="test-box"></div>
+        </div>
+
+        <div class="privacy">
+          <strong>プライバシー＆メモリ保護設計:</strong><br>
+          すべての処理はブラウザ内の専用Workerで完結し、外部へ一切送信されません。生成データは即座にBlob化され、不要なメモリ参照は自動解放されます。
+        </div>
+      </div>
+    </aside>
+  </main>
+
+  <footer class="footer">
+    Secure Gemini Code Packer — Strict CSP / CRC-32 Verified / Zero External Dependencies
+  </footer>
 </div>
 
 <script src="./app.js"></script>

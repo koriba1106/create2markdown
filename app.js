@@ -1,42 +1,93 @@
 "use strict";
 
 (function () {
-  const MAX_LOG_LINES = 300;
+  // 1. Clickjacking (フレーム埋め込み) 検知・即時遮断
+  if (window.self !== window.top) {
+    const blockedEl = document.getElementById("frameBlocked");
+    const appEl = document.getElementById("appRoot");
+    if (blockedEl) blockedEl.hidden = false;
+    if (appEl) appEl.hidden = true;
+    throw new Error("FRAME_EMBEDDING_BLOCKED");
+  }
+
+  const MAX_LOG_LINES = 200;
   const MAX_FOLDER_SCAN_ENTRIES = 10000;
   const SCAN_TIMEOUT_MS = 20000;
+  const PREVIEW_MAX_CHARS = 10000;
 
+  // DOM要素の取得
   const dropZone = document.getElementById("dropZone");
   const dropTitle = document.getElementById("dropTitle");
   const folderInput = document.getElementById("folderInput");
   const zipInput = document.getElementById("zipInput");
   const secretModeSelect = document.getElementById("secretModeSelect");
-  const boundaryCheck = document.getElementById("boundaryCheck");
+  const boundarySelect = document.getElementById("boundarySelect");
 
   const btnSelectFolder = document.getElementById("btnSelectFolder");
   const btnSelectZip = document.getElementById("btnSelectZip");
   const btnSelfTest = document.getElementById("btnSelfTest");
+  const btnClearMemory = document.getElementById("btnClearMemory");
   const btnCopy = document.getElementById("btnCopy");
   const btnDownload = document.getElementById("btnDownload");
   const btnCancel = document.getElementById("btnCancel");
   const btnClearLog = document.getElementById("btnClearLog");
 
   const confirmReviewedCheck = document.getElementById("confirmReviewedCheck");
+  const statBadge = document.getElementById("statBadge");
+  const metaInfo = document.getElementById("metaInfo");
+  const emptyState = document.getElementById("emptyState");
   const previewBox = document.getElementById("previewBox");
-  const progressBar = document.getElementById("progressBar");
+  const statusBox = document.getElementById("statusBox");
+  const logSection = document.getElementById("logSection");
   const logBox = document.getElementById("logBox");
 
-  const statScanned = document.getElementById("statScanned");
-  const statFiles = document.getElementById("statFiles");
-  const statSecretFiles = document.getElementById("statSecretFiles");
-  const statContentSkipped = document.getElementById("statContentSkipped");
-  const statRedacted = document.getElementById("statRedacted");
-  const statBytes = document.getElementById("statBytes");
-
+  // 状態・メモリ管理用変数
   let currentJob = null;
-  let generatedMarkdown = "";
+  let resultBlob = null;       // 巨大文字列を保持せずBlobとして保持
+  let activeObjectUrl = null;  // ObjectURLのリーク防止管理
   let currentRootName = "project";
 
+  // ===================================================================
+  // メモリ解放・クリーンアップ機構
+  // ===================================================================
+  function revokeActiveObjectUrl() {
+    if (activeObjectUrl) {
+      try {
+        URL.revokeObjectURL(activeObjectUrl);
+      } catch (_) {}
+      activeObjectUrl = null;
+    }
+  }
+
+  function releaseOutputMemory() {
+    revokeActiveObjectUrl();
+    resultBlob = null;
+    currentRootName = "project";
+    previewBox.textContent = "";
+    previewBox.hidden = true;
+    emptyState.hidden = false;
+    confirmReviewedCheck.checked = false;
+    confirmReviewedCheck.disabled = true;
+    btnClearMemory.disabled = true;
+    updateOutputButtonsState();
+  }
+
+  // ページ離脱・アンロード時に確実にメモリとWorkerを破棄
+  window.addEventListener("pagehide", () => {
+    cancelActiveJob("PAGE_UNLOAD");
+    releaseOutputMemory();
+  });
+
+  // ===================================================================
+  // UI更新ヘルパー
+  // ===================================================================
+  function setStatus(msg, isError = false) {
+    statusBox.textContent = msg;
+    statusBox.classList.toggle("error", Boolean(isError));
+  }
+
   function appendLog(msg) {
+    logSection.hidden = false;
     while (logBox.childNodes.length >= MAX_LOG_LINES) {
       logBox.removeChild(logBox.firstChild);
     }
@@ -46,27 +97,26 @@
     logBox.scrollTop = logBox.scrollHeight;
   }
 
-  function resetStatsUI() {
-    statScanned.textContent = "0";
-    statFiles.textContent = "0";
-    statSecretFiles.textContent = "0";
-    statContentSkipped.textContent = "0";
-    statRedacted.textContent = "0";
-    statBytes.textContent = "0 KB";
-  }
-
-  function updateStatsUI(stats) {
-    if (!stats) return;
-    statScanned.textContent = `${(stats.scannedEntries || 0).toLocaleString()} 件`;
-    statFiles.textContent = `${(stats.processedFiles || 0).toLocaleString()} 件`;
-    statSecretFiles.textContent = `${(stats.secretFilesBlocked || 0).toLocaleString()} 件`;
-    statContentSkipped.textContent = `${(stats.contentSecretSkipped || 0).toLocaleString()} 件`;
-    statRedacted.textContent = `${(stats.redactedSecretsCount || 0).toLocaleString()} 箇所`;
-    statBytes.textContent = `${((stats.totalBytes || 0) / 1024).toFixed(1)} KB`;
+  function updateStatsSummary(stats) {
+    if (!stats) {
+      statBadge.textContent = "待機中";
+      metaInfo.textContent = "まだファイルが読み込まれていません。";
+      return;
+    }
+    const kb = ((stats.totalBytes || 0) / 1024).toFixed(1);
+    const tokens = (stats.estimatedTokens || 0).toLocaleString();
+    statBadge.textContent = `採用 ${stats.processedFiles || 0} 件 (${kb} KB)`;
+    metaInfo.textContent =
+      `走査: ${(stats.scannedEntries || 0).toLocaleString()}件 ｜ ` +
+      `採用: ${(stats.processedFiles || 0).toLocaleString()}件 ｜ ` +
+      `機密ファイル名除外: ${stats.secretFilesBlocked || 0}件 ｜ ` +
+      `本文機密除外: ${stats.contentSecretSkipped || 0}件 ｜ ` +
+      `マスク: ${stats.redactedSecretsCount || 0}箇所 ｜ ` +
+      `推定トークン: 約${tokens}`;
   }
 
   function updateOutputButtonsState() {
-    const canExport = Boolean(generatedMarkdown) && confirmReviewedCheck.checked && !currentJob;
+    const canExport = Boolean(resultBlob) && confirmReviewedCheck.checked && !currentJob;
     btnCopy.disabled = !canExport;
     btnDownload.disabled = !canExport;
   }
@@ -75,44 +125,41 @@
 
   function setUIIdleState(keepOutput) {
     if (!keepOutput) {
-      generatedMarkdown = "";
-      previewBox.value = "";
-      confirmReviewedCheck.checked = false;
-      confirmReviewedCheck.disabled = true;
+      releaseOutputMemory();
+      updateStatsSummary(null);
     } else {
       confirmReviewedCheck.disabled = false;
+      btnClearMemory.disabled = false;
     }
     btnSelectFolder.disabled = false;
     btnSelectZip.disabled = false;
     btnSelfTest.disabled = false;
     btnCancel.disabled = true;
-    updateOutputButtonsState();
-
     dropZone.classList.remove("disabled");
-    progressBar.classList.remove("indeterminate");
-    progressBar.style.width = generatedMarkdown ? "100%" : "0%";
-    dropTitle.textContent = "📂 ここにフォルダ または ZIPファイル をドラッグ＆ドロップ";
+    dropTitle.textContent = "📂 フォルダ または ZIPファイル をここにドロップ";
+    updateOutputButtonsState();
   }
 
   function setUIBusyState(statusText) {
-    generatedMarkdown = "";
-    previewBox.value = "";
-    confirmReviewedCheck.checked = false;
-    confirmReviewedCheck.disabled = true;
-    resetStatsUI();
+    releaseOutputMemory();
+    statBadge.textContent = "処理中...";
+    setStatus(statusText || "⏳ 安全に解析・検証しています...", false);
 
     btnSelectFolder.disabled = true;
     btnSelectZip.disabled = true;
     btnSelfTest.disabled = true;
+    btnClearMemory.disabled = true;
     btnCancel.disabled = false;
     btnCopy.disabled = true;
     btnDownload.disabled = true;
 
     dropZone.classList.add("disabled");
-    progressBar.classList.add("indeterminate");
-    dropTitle.textContent = statusText || "⏳ 安全に解析・処理中...";
+    dropTitle.textContent = statusText || "⏳ 解析中...";
   }
 
+  // ===================================================================
+  // ジョブキャンセル・タイムアウト制御
+  // ===================================================================
   function cancelActiveJob(reason = "JOB_CANCELLED") {
     if (!currentJob) return false;
     const job = currentJob;
@@ -196,8 +243,8 @@
       if (scannedCount > MAX_FOLDER_SCAN_ENTRIES) {
         throw new Error(`フォルダ内の総エントリ数が上限(${MAX_FOLDER_SCAN_ENTRIES}件)を超えたため中断しました。`);
       }
-      if (scannedCount % 100 === 0) {
-        statScanned.textContent = `${scannedCount.toLocaleString()} 件 (走査中)`;
+      if (scannedCount % 150 === 0) {
+        statBadge.textContent = `走査中: ${scannedCount.toLocaleString()}件`;
       }
 
       if (entry.isFile) {
@@ -232,6 +279,9 @@
     return collected;
   }
 
+  // ===================================================================
+  // Worker 実行と厳格なリソース解放
+  // ===================================================================
   function runWorkerTask(payload, transferList = [], jobContext = null) {
     return new Promise((resolve, reject) => {
       let settled = false;
@@ -239,8 +289,8 @@
 
       try {
         worker = new Worker("./worker.js");
-      } catch (err) {
-        reject(new Error("Workerの起動に失敗しました（ローカル確認時はHTTPサーバー経由で開いてください）。"));
+      } catch (_) {
+        reject(new Error("Workerの起動に失敗しました（ローカル実行時はHTTPサーバー経由で開いてください）。"));
         return;
       }
 
@@ -282,7 +332,7 @@
         if (settled) return;
         const data = e.data;
         if (data.type === "progress") {
-          updateStatsUI(data.stats);
+          updateStatsSummary(data.stats);
         } else if (data.type === "complete") {
           settleResolve(data);
         } else if (data.type === "error") {
@@ -305,45 +355,53 @@
     try {
       payload.options = {
         secretMode: secretModeSelect.value,
-        includeBoundary: boundaryCheck.checked
+        includeBoundary: boundarySelect.value === "on"
       };
-      const result = await runWorkerTask(payload, transferList, job);
+
+      let result = await runWorkerTask(payload, transferList, job);
       if (currentJob === job) {
         currentJob = null;
       }
 
-      generatedMarkdown = result.markdown;
       currentRootName = result.rootName || "project";
-      updateStatsUI(result.stats);
+      updateStatsSummary(result.stats);
 
-      const previewSlice = generatedMarkdown.slice(0, 10000);
-      previewBox.value =
+      // 省メモリ設計: 長大な文字列は即座にBlobへ変換し、文字列参照(result.markdown)を破棄してGC対象にする
+      const totalChars = result.markdown.length;
+      const previewSlice = result.markdown.slice(0, PREVIEW_MAX_CHARS);
+      resultBlob = new Blob([result.markdown], { type: "text/markdown;charset=utf-8" });
+      result.markdown = ""; // 文字列参照を即座に切る
+
+      emptyState.hidden = true;
+      previewBox.hidden = false;
+      previewBox.textContent =
         previewSlice +
-        (generatedMarkdown.length > 10000
-          ? `\n\n... (以降 ${generatedMarkdown.length - 10000} 文字省略。全体は保存またはコピーで取得できます)`
+        (totalChars > PREVIEW_MAX_CHARS
+          ? `\n\n... (以降 ${(totalChars - PREVIEW_MAX_CHARS).toLocaleString()} 文字省略。保存またはコピーで全文を取得できます)`
           : "");
 
       setUIIdleState(true);
+      setStatus(`✅ 解析完了: ${result.stats.processedFiles}件のファイルを安全にパックしました。`, false);
 
-      appendLog(
-        `✅ 完了: 採用=${result.stats.processedFiles}件 / ファイル名除外=${result.stats.secretFilesBlocked}件 / 本文機密除外=${result.stats.contentSecretSkipped}件 / 本文マスク=${result.stats.redactedSecretsCount}箇所`
-      );
-      appendLog("🔎 プレビュー枠で内容を確認し、チェックボックスをONにするとコピー・保存が可能になります。");
-
-      for (const w of result.stats.warnings.slice(0, 20)) {
-        appendLog(`  🛡️ ${w}`);
+      if (result.stats.warnings && result.stats.warnings.length > 0) {
+        appendLog(`🛡️ 保護・除外ログ (${result.stats.warnings.length}件):`);
+        for (const w of result.stats.warnings.slice(0, 25)) {
+          appendLog(`  ・${w}`);
+        }
+        if (result.stats.warnings.length > 25) {
+          appendLog(`  ...他 ${result.stats.warnings.length - 25} 件の除外ログ`);
+        }
       }
-      if (result.stats.warnings.length > 20) {
-        appendLog(`  ...他 ${result.stats.warnings.length - 20} 件の保護ログ`);
-      }
+      result = null;
     } catch (err) {
       if (currentJob === job) {
         currentJob = null;
       }
       setUIIdleState(false);
       if (err.message === "JOB_CANCELLED") {
-        appendLog("🛑 処理をキャンセルし、Worker・待機Promise・メモリを解放しました。");
+        setStatus("🛑 処理を中断し、Workerおよびメモリを解放しました。", false);
       } else {
+        setStatus(`❌ エラー: ${err.message}`, true);
         appendLog(`❌ 中断・エラー: ${err.message}`);
       }
     }
@@ -351,12 +409,11 @@
 
   async function handleZipFile(file) {
     if (file.size > 50 * 1024 * 1024) {
-      appendLog("❌ ZIP圧縮サイズが上限(50MB)を超えているため拒否しました。");
+      setStatus("❌ ZIP圧縮サイズが上限(50MB)を超えているため拒否しました。", true);
       return;
     }
     const rootName = file.name.replace(/\.zip$/i, "");
-    setUIBusyState(`⏳ ZIP (${file.name}) の構造・CRC・ストリーム検証中...`);
-    appendLog(`▶ ZIPアーカイブ (${file.name}) の検査を開始...`);
+    setUIBusyState(`⏳ ZIP (${file.name}) の構造・CRC-32・ストリーム検証中...`);
 
     const job = { abortController: new AbortController(), cancelWorkerPromise: null };
     currentJob = job;
@@ -367,19 +424,29 @@
         job.abortController.signal,
         Date.now() + SCAN_TIMEOUT_MS
       );
+      // zipBufferをTransferableとしてWorkerへ完全移譲（メインスレッド側のメモリ消費をゼロ化）
       await executePackingJob({ mode: "zip", rootName, zipBuffer }, [zipBuffer], job);
     } catch (err) {
       if (currentJob === job) currentJob = null;
       setUIIdleState(false);
-      appendLog(err.message === "JOB_CANCELLED" ? "🛑 ZIP読込をキャンセルしました。" : `❌ ZIP読込失敗: ${err.message}`);
+      if (err.message === "JOB_CANCELLED") {
+        setStatus("🛑 ZIP読込をキャンセルしました。", false);
+      } else {
+        setStatus(`❌ ZIP読込失敗: ${err.message}`, true);
+      }
     }
   }
 
+  // ===================================================================
+  // イベントリスナー登録
+  // ===================================================================
   dropZone.addEventListener("dragover", (e) => {
     e.preventDefault();
     if (!currentJob) dropZone.classList.add("dragover");
   });
+
   dropZone.addEventListener("dragleave", () => dropZone.classList.remove("dragover"));
+
   dropZone.addEventListener("drop", async (e) => {
     e.preventDefault();
     dropZone.classList.remove("dragover");
@@ -403,8 +470,7 @@
     }
     if (entries.length === 0) return;
 
-    setUIBusyState("⏳ フォルダ階層を走査中 (キャンセル可能)...");
-    appendLog("▶ フォルダ走査を開始...");
+    setUIBusyState("⏳ フォルダ階層を走査中...");
     const job = { abortController: new AbortController(), cancelWorkerPromise: null };
     currentJob = job;
 
@@ -424,27 +490,42 @@
         }));
       }
 
-      dropTitle.textContent = "⏳ Workerでファイル内容と機密情報を検査中...";
+      setStatus("⏳ Workerでファイル内容と機密情報を検査中...", false);
       await executePackingJob({ mode: "files", rootName, files: allFiles }, [], job);
     } catch (err) {
       if (currentJob === job) currentJob = null;
       setUIIdleState(false);
-      appendLog(err.message === "JOB_CANCELLED" ? "🛑 フォルダ走査をキャンセルしました。" : `❌ 走査中断: ${err.message}`);
+      if (err.message === "JOB_CANCELLED") {
+        setStatus("🛑 フォルダ走査をキャンセルしました。", false);
+      } else {
+        setStatus(`❌ 走査中断: ${err.message}`, true);
+      }
+    }
+  });
+
+  dropZone.addEventListener("click", (e) => {
+    if (currentJob) return;
+    if (e.target === folderInput || e.target === zipInput) return;
+    folderInput.click();
+  });
+
+  dropZone.addEventListener("keydown", (e) => {
+    if (currentJob) return;
+    if (e.key === "Enter" || e.key === " ") {
+      e.preventDefault();
+      folderInput.click();
     }
   });
 
   btnSelectFolder.addEventListener("click", () => folderInput.click());
   btnSelectZip.addEventListener("click", () => zipInput.click());
-  dropZone.addEventListener("click", () => {
-    if (!currentJob) folderInput.click();
-  });
 
   folderInput.addEventListener("change", async (e) => {
     const rawList = e.target.files;
     if (!rawList || rawList.length === 0) return;
 
     if (rawList.length > MAX_FOLDER_SCAN_ENTRIES) {
-      appendLog(`❌ 選択されたファイル数(${rawList.length}件)が走査上限(${MAX_FOLDER_SCAN_ENTRIES}件)を超えています。`);
+      setStatus(`❌ 選択ファイル数(${rawList.length}件)が走査上限(${MAX_FOLDER_SCAN_ENTRIES}件)を超えています。`, true);
       folderInput.value = "";
       return;
     }
@@ -464,8 +545,7 @@
     }
     folderInput.value = "";
 
-    setUIBusyState(`⏳ フォルダ (${rootName}) を検査中...`);
-    appendLog(`▶ フォルダ (${rootName}: ${files.length}件) の処理を開始...`);
+    setUIBusyState(`⏳ フォルダ (${rootName}: ${files.length}件) を検査中...`);
     await executePackingJob({ mode: "files", rootName, files });
   });
 
@@ -479,33 +559,44 @@
     cancelActiveJob("JOB_CANCELLED");
   });
 
+  btnClearMemory.addEventListener("click", () => {
+    releaseOutputMemory();
+    updateStatsSummary(null);
+    setStatus("🧹 出力データとプレビューメモリを完全に解放しました。", false);
+  });
+
   btnClearLog.addEventListener("click", () => {
     logBox.textContent = "";
+    logSection.hidden = true;
   });
 
   btnCopy.addEventListener("click", async () => {
-    if (!generatedMarkdown || !confirmReviewedCheck.checked) return;
+    if (!resultBlob || !confirmReviewedCheck.checked) return;
     try {
-      await navigator.clipboard.writeText(generatedMarkdown);
-      appendLog("📋 確認済みMarkdownをクリップボードにコピーしました。");
+      const text = await resultBlob.text();
+      await navigator.clipboard.writeText(text);
+      setStatus("📋 確認済みMarkdownをクリップボードにコピーしました。", false);
     } catch (err) {
-      appendLog(`❌ コピー失敗: ${err.message}`);
+      setStatus(`❌ コピー失敗: ${err.message}`, true);
     }
   });
 
   btnDownload.addEventListener("click", () => {
-    if (!generatedMarkdown || !confirmReviewedCheck.checked) return;
+    if (!resultBlob || !confirmReviewedCheck.checked) return;
+    revokeActiveObjectUrl();
     const safeName = currentRootName.replace(/[^a-zA-Z0-9_-]/g, "_") || "project";
-    const blob = new Blob([generatedMarkdown], { type: "text/markdown;charset=utf-8" });
-    const url = URL.createObjectURL(blob);
+    activeObjectUrl = URL.createObjectURL(resultBlob);
+
     const a = document.createElement("a");
-    a.href = url;
+    a.href = activeObjectUrl;
     a.download = `${safeName}_gemini_context.md`;
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
-    setTimeout(() => URL.revokeObjectURL(url), 60000);
-    appendLog(`💾 ${safeName}_gemini_context.md のダウンロードを開始しました。`);
+
+    // ダウンロード開始後、10秒で確実にURL参照を解放
+    setTimeout(revokeActiveObjectUrl, 10000);
+    setStatus(`💾 ${safeName}_gemini_context.md を保存しました。`, false);
   });
 
   // ===================================================================
@@ -567,7 +658,6 @@
       const crc = item.customCrc !== undefined ? item.customCrc : testCrc32(rawData);
       const uncompLen = item.fakeUncompSize !== undefined ? item.fakeUncompSize : rawData.byteLength;
       const compLen = compData.byteLength;
-
       const myLhOffset = item.forceLhOffset !== undefined ? item.forceLhOffset : offset;
 
       if (!item.skipLocalHeaderWrite) {
@@ -607,7 +697,6 @@
     const cdStart = offset;
     let cdSize = 0;
     for (const c of cdParts) cdSize += c.byteLength;
-
     const declaredCdSize = options.corruptCdSize !== undefined ? options.corruptCdSize : cdSize;
 
     const eocd = new Uint8Array(22);
@@ -628,6 +717,7 @@
 
   btnSelfTest.addEventListener("click", async () => {
     if (currentJob) return;
+    logBox.textContent = "";
     setUIBusyState("🧪 厳格セキュリティ自己診断 (12項目) を実行中...");
     appendLog("=== 🧪 厳格セキュリティ自己診断スイート (全12項目) 開始 ===");
 
@@ -635,7 +725,7 @@
     async function expectReject(testName, zipBuf, expectedSubstr) {
       try {
         await runWorkerTask({ mode: "zip", rootName: "test", zipBuffer: zipBuf }, [zipBuf]);
-        results.push({ name: testName, pass: false, detail: "拒否されず通過してしまいました" });
+        results.push({ name: testName, pass: false, detail: "拒否されず通過" });
       } catch (err) {
         const matched = !expectedSubstr || err.message.includes(expectedSubstr);
         results.push({ name: testName, pass: matched, detail: err.message });
@@ -643,42 +733,28 @@
     }
 
     try {
-      // テスト1: Central Directory の宣言サイズが EOCD 境界を超える不正ZIPの拒否
       const badCdZip = buildCustomTestZip([{ name: "a.py", data: "x=1" }], { corruptCdSize: 99999 });
-      await expectReject("1. Central Directory 境界逸脱(EOCD侵食)の拒否", badCdZip, "Central Directory");
+      await expectReject("1. Central Directory 境界逸脱の拒否", badCdZip, "Central Directory");
 
-      // テスト2: ローカルヘッダとCentral Directoryのファイル名不整合の拒否
       const mismatchZip = buildCustomTestZip([{ name: "safe.py", lfhName: "evil.py", data: "x=1" }]);
-      await expectReject("2. ローカルヘッダとCentral Directoryの不整合拒否", mismatchZip, "矛盾");
+      await expectReject("2. LFH/CD ヘッダ不整合の拒否", mismatchZip, "矛盾");
 
-      // テスト3: エントリ領域オーバーラップ(重複参照)ZIPの拒否
       const overlapZip = buildCustomTestZip([
         { name: "a.py", data: "print(1)" },
         { name: "b.py", data: "print(1)", forceLhOffset: 0, skipLocalHeaderWrite: true }
       ]);
-      await expectReject("3. エントリ領域重複(Overlap)アーカイブの拒否", overlapZip, "Overlap");
+      await expectReject("3. エントリ領域重複(Overlap)の拒否", overlapZip, "Overlap");
 
-      // テスト4: CRC-32 不一致（データ破損・改ざん）の拒否
       const badCrcZip = buildCustomTestZip([{ name: "corrupt.py", data: "print('hello')", customCrc: 0x12345678 }]);
-      await expectReject("4. CRC-32 不一致（改ざんデータ）の検証と拒否", badCrcZip, "CRC_MISMATCH");
+      await expectReject("4. CRC-32 不一致（改ざん）の拒否", badCrcZip, "CRC_MISMATCH");
 
-      // テスト5〜11: 複合検査
       const bombPayload = new Uint8Array(20 * 1024).fill(65);
       const compressedBomb = await deflateRawBytes(bombPayload);
       const mainSuitZip = buildCustomTestZip([
-        {
-          name: "src/spoofed_bomb.py",
-          data: bombPayload,
-          compressedData: compressedBomb,
-          method: 8,
-          fakeUncompSize: 64
-        },
+        { name: "src/spoofed_bomb.py", data: bombPayload, compressedData: compressedBomb, method: 8, fakeUncompSize: 64 },
         { name: "../../etc/passwd.py", data: "print('zip_slip')" },
         { name: ".env.local", data: "SECRET=1" },
-        {
-          name: "src/unquoted_secrets.py",
-          data: "password = my-secret-value\nAPI_KEY=example-secret-value\n# Authorization: Bearer example-token\n"
-        },
+        { name: "src/unquoted_secrets.py", data: "password = my-secret-value\nAPI_KEY=example-secret-value\n# Authorization: Bearer example-token\n" },
         { name: "src/__proto__/constructor.py", data: "ok = True" },
         { name: "src/back`tick``name.py", data: "val = 1" },
         { name: "src/fence.md", data: "Doc\n```js\nconsole.log(1);\n```\n" }
@@ -702,50 +778,39 @@
       results.push({
         name: "5. ヘッダ偽装Deflate Zip Bombの実ストリーム遮断",
         pass: !md.includes("spoofed_bomb.py") && suitRes.stats.warnings.some((w) => w.includes("Zip Bomb防御")),
-        detail: "DecompressionStreamチャンク監視により10KB超過時点で遮断"
+        detail: "10KB超過時点でストリーム即時破棄"
       });
-
       results.push({
         name: "6. Zip Slip (../../) パストラバーサル遮断",
         pass: !md.includes("zip_slip") && !md.includes("passwd"),
         detail: "不正相対パスを拒否"
       });
-
       results.push({
-        name: "7. 引用符なし秘密情報(password = ..., API_KEY=..., Bearer)の検出・マスク",
-        pass:
-          !md.includes("my-secret-value") &&
-          !md.includes("example-secret-value") &&
-          !md.includes("example-token") &&
-          suitRes.stats.redactedSecretsCount >= 3,
-        detail: `${suitRes.stats.redactedSecretsCount}箇所の非引用符クレデンシャル・Bearerを捕捉`
+        name: "7. 引用符なし秘密情報・Bearerトークンの検出とマスク",
+        pass: !md.includes("my-secret-value") && !md.includes("example-secret-value") && !md.includes("example-token") && suitRes.stats.redactedSecretsCount >= 3,
+        detail: `${suitRes.stats.redactedSecretsCount}箇所を捕捉`
       });
-
       results.push({
         name: "8. 機密ファイル名 (.env.local) の除外",
         pass: !md.includes("SECRET=1") && suitRes.stats.secretFilesBlocked >= 1,
         detail: "ブラックリストにより除外"
       });
-
       results.push({
-        name: "9. __proto__ / constructor 特殊名のMap/Set安全ツリー構築",
+        name: "9. __proto__ / constructor 特殊名の安全ツリー構築",
         pass: md.includes("📁 __proto__/") && md.includes("📄 constructor.py"),
-        detail: "プロトタイプ汚染なしでツリー出力"
+        detail: "Map/Setによるプロトタイプ汚染防止"
       });
-
       results.push({
-        name: "10. バッククォートを含むファイル名のCommonMarkコードスパン保護",
+        name: "10. バッククォートを含むファイル名のコードスパン保護",
         pass: md.includes("```src/back`tick``name.py```"),
-        detail: "3連バッククォートデリミタでヘッダ破壊を防止"
+        detail: "CommonMark準拠エスケープ"
       });
-
       results.push({
         name: "11. 本文内3連バッククォートに対する動的4連フェンス生成",
         pass: md.includes("````md"),
-        detail: "コードブロック閉じ破壊を防止"
+        detail: "Markdown構造破壊を防止"
       });
 
-      // テスト12: 総展開バジェット上限到達時の停止 ＆ キャンセル時のPromise即時reject解決検証
       const budgetZip = buildCustomTestZip([
         { name: "f1.py", data: "A".repeat(4000) },
         { name: "f2.py", data: "B".repeat(4000) },
@@ -774,28 +839,27 @@
       }
 
       results.push({
-        name: "12. 総展開バジェット上限停止 ＆ キャンセル時のPromise確実決済",
+        name: "12. 総展開バジェット上限停止 ＆ キャンセル時リソース即時解放",
         pass: budgetPassed && cancelSettled,
-        detail: `バジェット停止(2/3件で停止=${budgetPassed}), キャンセルPromise即時reject=${cancelSettled}`
+        detail: `バジェット停止=${budgetPassed}, キャンセル即時決済=${cancelSettled}`
       });
 
       let allPassed = true;
       for (const r of results) {
-        appendLog(`  ${r.pass ? "✅ PASS" : "❌ FAIL"} : ${r.name} (${r.detail})`);
+        appendLog(`${r.pass ? "✅ PASS" : "❌ FAIL"} : ${r.name} (${r.detail})`);
         if (!r.pass) allPassed = false;
       }
 
       setUIIdleState(false);
-      appendLog(
+      setStatus(
         allPassed
-          ? "=== 🎉 全12項目の厳格セキュリティ検証にすべて合格しました ==="
-          : "=== ⚠️ 一部の検証項目が失敗しました ==="
+          ? "🎉 全12項目の厳格セキュリティ自己診断にすべて合格しました。"
+          : "⚠️ 一部の自己診断項目が失敗しました。ログを確認してください。",
+        !allPassed
       );
     } catch (err) {
       setUIIdleState(false);
-      appendLog(`❌ 自己診断中に予期しない例外: ${err.message}`);
+      setStatus(`❌ 自己診断エラー: ${err.message}`, true);
     }
   });
-
-  appendLog("🛡️ Strict Audited Edition 初期化完了 (単体5MB / 合計50MB / Strict CSP / CRC-32検証有効)");
 })();

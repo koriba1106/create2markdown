@@ -1,17 +1,21 @@
 "use strict";
 
 // =====================================================================
-// 1. セキュリティ制限・検査ポリシー定義 (単体5MB / 展開合計50MB / 出力40MB)
+// 1. セキュリティ制限・検査ポリシー定義
 // =====================================================================
 const DEFAULT_CONFIG = Object.freeze({
   MAX_SINGLE_FILE_BYTES: 5 * 1024 * 1024,          // 1ファイル最大 5MB
-  MAX_TOTAL_DECOMPRESSED_BYTES: 50 * 1024 * 1024,  // スキップ分を含む総展開量上限 50MB
-  MAX_MARKDOWN_CHARS: 40 * 1024 * 1024,            // 最終Markdown文字列の最大長 (約40MB相当)
+  MAX_TOTAL_DECOMPRESSED_BYTES: 50 * 1024 * 1024,  // 総展開量上限 50MB
+  MAX_MARKDOWN_CHARS: 40 * 1024 * 1024,            // 最終Markdown文字列最大長 (約40MB相当)
   MAX_ACCEPTED_FILES: 2000,                        // 採用ファイル数上限
   MAX_SCANNED_ENTRIES: 10000,                      // 総走査エントリ上限
-  MAX_DEPTH: 25,                                   // 最大階層
-  TIMEOUT_MS: 30000                                // 処理タイムアウト 30秒
+  MAX_DEPTH: 25,                                   // 最大ディレクトリ階層
+  TIMEOUT_MS: 30000,                               // 処理タイムアウト 30秒
+  MAX_SAFE_LINE_LENGTH: 4000                       // ReDoS対策の1行あたり安全検査長
 });
+
+// Trojan Source (CVE-2021-42574) 双方向制御文字パターン
+const BIDI_CONTROL_REGEX = /[\u202A-\u202E\u2066-\u2069\u200E\u200F\u061C]/g;
 
 const EXCLUDE_DIRS = new Set([
   ".git", ".svn", ".hg", "node_modules", "venv", ".venv", "env",
@@ -44,23 +48,22 @@ const SECRET_FILENAME_PATTERNS = [
   /^\.(npmrc|pypirc|netrc|htpasswd|pgpass|aws|docker)$/i
 ];
 
-// 引用符なし代入・Bearerトークン・接続URI・JWT等を網羅した検出ルール
 const SECRET_CONTENT_RULES = [
   {
     name: "Private Key Block",
-    regex: /-----BEGIN (?:[A-Z0-9]+ )?PRIVATE KEY-----[\s\S]*?-----END (?:[A-Z0-9]+ )?PRIVATE KEY-----/g
+    regex: /-----BEGIN (?:[A-Z0-9]+ )?PRIVATE KEY-----[\s\S]{0,16384}?-----END (?:[A-Z0-9]+ )?PRIVATE KEY-----/g
   },
   {
     name: "Authorization / Bearer Token",
-    regex: /\b(?:Authorization\s*:\s*(?:Bearer|Basic|Token|Digest)\s+[A-Za-z0-9._~+\/-]+=*|Bearer\s+[A-Za-z0-9._~+\/-]{8,})\b/gi
+    regex: /\b(?:Authorization\s*:\s*(?:Bearer|Basic|Token|Digest)\s+[A-Za-z0-9._~+\/-]+=*|Bearer\s+[A-Za-z0-9._~+\/-]{8,256})\b/gi
   },
   {
     name: "Database / Service Connection URI",
-    regex: /\b(?:mongodb(?:\+srv)?|postgres(?:ql)?|mysql|mariadb|redis|rediss|amqp|amqps|mssql):\/\/[^:\s\/"']+:[^@\s\/"']+@[^\s"']+/gi
+    regex: /\b(?:mongodb(?:\+srv)?|postgres(?:ql)?|mysql|mariadb|redis|rediss|amqp|amqps|mssql):\/\/[^:\s\/"']{1,128}:[^@\s\/"']{1,256}@[^\s"']{1,256}/gi
   },
   {
     name: "JSON Web Token (JWT)",
-    regex: /\beyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b/g
+    regex: /\beyJ[A-Za-z0-9_-]{10,512}\.eyJ[A-Za-z0-9_-]{10,1024}\.[A-Za-z0-9_-]{10,512}\b/g
   },
   {
     name: "AWS Access Key",
@@ -80,8 +83,8 @@ const SECRET_CONTENT_RULES = [
   }
 ];
 
-// 引用符あり・なし両対応の Key-Value 認証情報割り当て検査
-const KV_SECRET_LINE_REGEX = /\b(api[_-]?key|apikey|secret[_-]?key|client[_-]?secret|access[_-]?token|auth[_-]?token|refresh[_-]?token|private[_-]?key|password|passwd|pwd|db[_-]?pass(?:word)?)\b\s*(?:[:=]|=>)\s*([^\r\n]+)/gi;
+// ReDoSを防ぐため、右辺のマッチ長を最大512文字に制限
+const KV_SECRET_LINE_REGEX = /\b(api[_-]?key|apikey|secret[_-]?key|client[_-]?secret|access[_-]?token|auth[_-]?token|refresh[_-]?token|private[_-]?key|password|passwd|pwd|db[_-]?pass(?:word)?)\b\s*(?:[:=]|=>)\s*([^\r\n]{1,512})/gi;
 
 function isSafePlaceholderValue(rawVal) {
   let v = rawVal.trim();
@@ -107,9 +110,19 @@ function isSafePlaceholderValue(rawVal) {
   return false;
 }
 
-function scanAndSanitizeContent(text, secretMode) {
+function stripBidiControls(text) {
+  BIDI_CONTROL_REGEX.lastIndex = 0;
+  if (!BIDI_CONTROL_REGEX.test(text)) {
+    return { text, stripped: false };
+  }
+  BIDI_CONTROL_REGEX.lastIndex = 0;
+  return { text: text.replace(BIDI_CONTROL_REGEX, ""), stripped: true };
+}
+
+function scanAndSanitizeContent(rawText, secretMode) {
+  const bidiRes = stripBidiControls(rawText);
+  let sanitized = bidiRes.text;
   let detectedCount = 0;
-  let sanitized = text;
 
   for (const rule of SECRET_CONTENT_RULES) {
     rule.regex.lastIndex = 0;
@@ -117,7 +130,7 @@ function scanAndSanitizeContent(text, secretMode) {
     if (matches && matches.length > 0) {
       detectedCount += matches.length;
       if (secretMode === "skip") {
-        return { blocked: true, count: detectedCount, text: "" };
+        return { blocked: true, count: detectedCount, bidiStripped: bidiRes.stripped, text: "" };
       }
       const tag = `[REDACTED_${rule.name.toUpperCase().replace(/[^A-Z0-9]+/g, "_")}]`;
       sanitized = sanitized.replace(rule.regex, tag);
@@ -137,9 +150,9 @@ function scanAndSanitizeContent(text, secretMode) {
   });
 
   if (secretMode === "skip" && detectedCount > 0) {
-    return { blocked: true, count: detectedCount, text: "" };
+    return { blocked: true, count: detectedCount, bidiStripped: bidiRes.stripped, text: "" };
   }
-  return { blocked: false, count: detectedCount, text: sanitized };
+  return { blocked: false, count: detectedCount, bidiStripped: bidiRes.stripped, text: sanitized };
 }
 
 // =====================================================================
@@ -166,7 +179,7 @@ function computeCrc32(uint8Array) {
 }
 
 // =====================================================================
-// 3. 厳密なZIP構造・境界・整合性・重複検証パーサー
+// 3. 厳密なZIP構造・境界・整合性・Symlink検証パーサー
 // =====================================================================
 function parseAndValidateZipStructure(buffer, limits) {
   const view = new DataView(buffer);
@@ -175,7 +188,6 @@ function parseAndValidateZipStructure(buffer, limits) {
     throw new Error("無効なZIPアーカイブです（最小サイズ未満）。");
   }
 
-  // 1. EOCD (End of Central Directory: 0x06054b50) の厳密検証
   const minEocdOffset = Math.max(0, len - 65557);
   let eocdOffset = -1;
   for (let i = len - 22; i >= minEocdOffset; i--) {
@@ -208,7 +220,6 @@ function parseAndValidateZipStructure(buffer, limits) {
     throw new Error(`ZIP内の総エントリ数(${totalEntries}件)が安全上限(${limits.MAX_SCANNED_ENTRIES}件)を超えています。`);
   }
 
-  // Central Directory の終端が EOCD の開始位置を超えないことを厳密に検証
   const cdEnd = cdOffset + cdSize;
   if (!Number.isSafeInteger(cdEnd) || cdOffset < 0 || cdSize < 0 || cdEnd > eocdOffset) {
     throw new Error("ZIPのCentral Directory領域がEOCD境界を超えているか破損しています。");
@@ -219,7 +230,6 @@ function parseAndValidateZipStructure(buffer, limits) {
   const utf8Decoder = new TextDecoder("utf-8", { fatal: true });
   const fallbackDecoder = new TextDecoder("utf-8", { fatal: false });
 
-  // 2. Central Directory 各エントリの境界検証
   for (let i = 0; i < totalEntries; i++) {
     if (ptr + 46 > cdEnd) {
       throw new Error("Central Directoryエントリの固定ヘッダが宣言領域(cdEnd)を超えています。");
@@ -236,6 +246,7 @@ function parseAndValidateZipStructure(buffer, limits) {
     const nameLen = view.getUint16(ptr + 28, true);
     const extraLen = view.getUint16(ptr + 30, true);
     const commentLen = view.getUint16(ptr + 32, true);
+    const externalAttrs = view.getUint32(ptr + 38, true);
     const localHeaderOffset = view.getUint32(ptr + 42, true);
 
     const entryEnd = ptr + 46 + nameLen + extraLen + commentLen;
@@ -252,6 +263,10 @@ function parseAndValidateZipStructure(buffer, limits) {
     if (method === 0 && compSize !== uncompSize) {
       throw new Error("無圧縮(Stored)エントリの圧縮サイズと展開サイズが矛盾しています。");
     }
+
+    // UNIX Symlink (0120000) の検出フラグ
+    const unixMode = (externalAttrs >>> 16) & 0o170000;
+    const isSymlink = unixMode === 0o120000;
 
     const nameBytes = new Uint8Array(buffer, ptr + 46, nameLen);
     let name;
@@ -270,7 +285,8 @@ function parseAndValidateZipStructure(buffer, limits) {
       compSize,
       uncompSize,
       localHeaderOffset,
-      isDir: name.endsWith("/")
+      isDir: name.endsWith("/"),
+      isSymlink
     });
 
     ptr = entryEnd;
@@ -280,7 +296,6 @@ function parseAndValidateZipStructure(buffer, limits) {
     throw new Error("Central Directoryの実サイズと宣言サイズ(cdSize)が一致しません。");
   }
 
-  // 3. ローカルヘッダ(LFH)との完全整合性検証 ＆ エントリ領域の重複(Overlap)検査
   const offsetSorted = entries.slice().sort((a, b) => a.localHeaderOffset - b.localHeaderOffset);
   let prevRegionEnd = 0;
 
@@ -369,6 +384,7 @@ async function extractAndVerifyZipEntry(buffer, entry, limits, budgetTracker, de
       while (true) {
         if (Date.now() > deadline) {
           await reader.cancel();
+          chunks.length = 0;
           throw new Error("TIMEOUT_LIMIT");
         }
         const { value, done } = await reader.read();
@@ -379,10 +395,12 @@ async function extractAndVerifyZipEntry(buffer, entry, limits, budgetTracker, de
 
           if (fileReadBytes > limits.MAX_SINGLE_FILE_BYTES) {
             await reader.cancel();
+            chunks.length = 0;
             throw new Error("SINGLE_FILE_LIMIT");
           }
           if (budgetTracker.totalDecompressed > limits.MAX_TOTAL_DECOMPRESSED_BYTES) {
             await reader.cancel();
+            chunks.length = 0;
             throw new Error("TOTAL_BUDGET_LIMIT");
           }
           chunks.push(value);
@@ -394,10 +412,12 @@ async function extractAndVerifyZipEntry(buffer, entry, limits, budgetTracker, de
 
     decompressedBytes = new Uint8Array(fileReadBytes);
     let offset = 0;
-    for (const c of chunks) {
-      decompressedBytes.set(c, offset);
-      offset += c.byteLength;
+    for (let i = 0; i < chunks.length; i++) {
+      decompressedBytes.set(chunks[i], offset);
+      offset += chunks[i].byteLength;
+      chunks[i] = null; // チャンク参照を即時解放
     }
+    chunks.length = 0;
   } else {
     throw new Error(`未対応の圧縮メソッド(${entry.method})`);
   }
@@ -421,7 +441,8 @@ function sanitizeRelativePath(rawPath) {
   if (!rawPath || typeof rawPath !== "string") return null;
   if (/[\x00-\x1f\x7f]/.test(rawPath)) return null;
 
-  const normalized = rawPath.replace(/\\/g, "/").trim();
+  const cleanBidi = rawPath.replace(BIDI_CONTROL_REGEX, "");
+  const normalized = cleanBidi.replace(/\\/g, "/").trim();
   if (normalized.startsWith("/") || /^[a-zA-Z]:/.test(normalized)) return null;
 
   const parts = [];
@@ -474,7 +495,6 @@ function getSafeCodeFence(content) {
   return "`".repeat(maxLen + 1);
 }
 
-// CommonMark仕様準拠のインラインコードスパン生成
 function formatCommonMarkCodeSpan(rawText) {
   const clean = String(rawText).replace(/[\r\n\t]/g, " ");
   const matches = clean.match(/`+/g);
@@ -510,7 +530,7 @@ function buildSafeTreeString(rootName, relPaths) {
     curr.files.add(parts[parts.length - 1]);
   }
 
-  const cleanRoot = String(rootName || "project").replace(/[\r\n]/g, "");
+  const cleanRoot = String(rootName || "project").replace(/[\r\n]/g, "").replace(BIDI_CONTROL_REGEX, "");
   const lines = [`📁 ${cleanRoot}/`];
 
   function render(node, prefix) {
@@ -529,7 +549,7 @@ function buildSafeTreeString(rootName, relPaths) {
 }
 
 // =====================================================================
-// 5. Worker メイン処理 (省メモリ1パス逐次変換＆最終サイズ上限監視)
+// 5. Worker メイン処理 (省メモリ逐次変換＆メモリ上限監視)
 // =====================================================================
 self.onmessage = async (e) => {
   const { mode, rootName, files, zipBuffer, options } = e.data;
@@ -583,7 +603,8 @@ self.onmessage = async (e) => {
       const entries = parseAndValidateZipStructure(zipBuffer, limits);
       entries.sort((a, b) => a.name.localeCompare(b.name));
 
-      for (const entry of entries) {
+      for (let i = 0; i < entries.length; i++) {
+        const entry = entries[i];
         if (Date.now() > deadline) {
           throw new Error("処理時間が制限を超過したため安全中断しました。");
         }
@@ -593,6 +614,12 @@ self.onmessage = async (e) => {
         if (stats.scannedEntries > limits.MAX_SCANNED_ENTRIES) {
           stats.warnings.push(`総走査上限(${limits.MAX_SCANNED_ENTRIES}件)に達したため中断`);
           break;
+        }
+
+        if (entry.isSymlink) {
+          stats.skippedFiles++;
+          stats.warnings.push(`[Symlink遮断] シンボリックリンクを除外: ${String(entry.name).slice(0, 80)}`);
+          continue;
         }
 
         const safePath = sanitizeRelativePath(entry.name);
@@ -656,18 +683,25 @@ self.onmessage = async (e) => {
         }
 
         if (isBinaryBuffer(rawBytes)) {
+          rawBytes = null;
           stats.skippedFiles++;
           continue;
         }
 
         const byteLen = rawBytes.byteLength;
-        const rawText = decodeBufferSafely(rawBytes);
+        let rawText = decodeBufferSafely(rawBytes);
         rawBytes = null;
 
-        const scanRes = scanAndSanitizeContent(rawText, secretMode);
+        let scanRes = scanAndSanitizeContent(rawText, secretMode);
+        rawText = null;
+
+        if (scanRes.bidiStripped) {
+          stats.warnings.push(`[Trojan Source防御] 双方向制御文字を除去: ${safePath}`);
+        }
         if (scanRes.blocked) {
           stats.contentSecretSkipped++;
           stats.warnings.push(`[本文機密除外] 秘密情報(${scanRes.count}箇所)を含むためファイル除外: ${safePath}`);
+          scanRes = null;
           continue;
         }
         if (scanRes.count > 0) {
@@ -677,7 +711,9 @@ self.onmessage = async (e) => {
 
         try {
           appendFileSectionSafely(safePath, scanRes.text);
+          scanRes = null;
         } catch (memErr) {
+          scanRes = null;
           if (memErr.message === "MARKDOWN_MEMORY_LIMIT") {
             stats.warnings.push("最終Markdownサイズ上限に到達したため以降のファイルを省略しました。");
             break;
@@ -695,7 +731,10 @@ self.onmessage = async (e) => {
     } else if (mode === "files") {
       const sortedItems = files.slice().sort((a, b) => a.relPath.localeCompare(b.relPath));
 
-      for (const item of sortedItems) {
+      for (let i = 0; i < sortedItems.length; i++) {
+        const item = sortedItems[i];
+        sortedItems[i] = null; // 処理済みFile参照を順次解放
+
         if (Date.now() > deadline) {
           throw new Error("処理時間が制限を超過したため安全中断しました。");
         }
@@ -751,18 +790,25 @@ self.onmessage = async (e) => {
         budgetTracker.totalDecompressed += rawBytes.byteLength;
 
         if (isBinaryBuffer(rawBytes)) {
+          rawBytes = null;
           stats.skippedFiles++;
           continue;
         }
 
         const byteLen = rawBytes.byteLength;
-        const rawText = decodeBufferSafely(rawBytes);
+        let rawText = decodeBufferSafely(rawBytes);
         rawBytes = null;
 
-        const scanRes = scanAndSanitizeContent(rawText, secretMode);
+        let scanRes = scanAndSanitizeContent(rawText, secretMode);
+        rawText = null;
+
+        if (scanRes.bidiStripped) {
+          stats.warnings.push(`[Trojan Source防御] 双方向制御文字を除去: ${safePath}`);
+        }
         if (scanRes.blocked) {
           stats.contentSecretSkipped++;
           stats.warnings.push(`[本文機密除外] 秘密情報(${scanRes.count}箇所)を含むためファイル除外: ${safePath}`);
+          scanRes = null;
           continue;
         }
         if (scanRes.count > 0) {
@@ -772,7 +818,9 @@ self.onmessage = async (e) => {
 
         try {
           appendFileSectionSafely(safePath, scanRes.text);
+          scanRes = null;
         } catch (memErr) {
+          scanRes = null;
           if (memErr.message === "MARKDOWN_MEMORY_LIMIT") {
             stats.warnings.push("最終Markdownサイズ上限に到達したため以降のファイルを省略しました。");
             break;
@@ -790,6 +838,8 @@ self.onmessage = async (e) => {
     }
 
     const treeStr = buildSafeTreeString(rootName, acceptedPaths);
+    acceptedPaths.length = 0;
+
     const treeFence = getSafeCodeFence(treeStr);
     const headerChunks = ["# Project Context for Gemini\n\n"];
 
@@ -808,7 +858,9 @@ self.onmessage = async (e) => {
     );
 
     const finalMarkdown = headerChunks.join("") + fileSectionChunks.join("");
+    headerChunks.length = 0;
     fileSectionChunks.length = 0;
+
     stats.estimatedTokens = stats.totalBytes > 0 ? Math.max(1, Math.floor(stats.totalBytes / 3.5)) : 0;
 
     self.postMessage({
@@ -818,6 +870,8 @@ self.onmessage = async (e) => {
       rootName
     });
   } catch (err) {
+    acceptedPaths.length = 0;
+    fileSectionChunks.length = 0;
     self.postMessage({
       type: "error",
       message: err && err.message ? err.message : String(err),
