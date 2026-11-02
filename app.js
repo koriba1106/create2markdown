@@ -15,20 +15,24 @@
   const SCAN_TIMEOUT_MS = 20000;
   const PREVIEW_MAX_CHARS = 10000;
 
-  // DOM要素の取得
+  // DOM要素
   const dropZone = document.getElementById("dropZone");
   const dropTitle = document.getElementById("dropTitle");
   const folderInput = document.getElementById("folderInput");
   const zipInput = document.getElementById("zipInput");
+  const mdRestoreInput = document.getElementById("mdRestoreInput");
   const secretModeSelect = document.getElementById("secretModeSelect");
   const boundarySelect = document.getElementById("boundarySelect");
 
   const btnSelectFolder = document.getElementById("btnSelectFolder");
   const btnSelectZip = document.getElementById("btnSelectZip");
+  const btnSelectMd = document.getElementById("btnSelectMd");
   const btnSelfTest = document.getElementById("btnSelfTest");
   const btnClearMemory = document.getElementById("btnClearMemory");
-  const btnCopy = document.getElementById("btnCopy");
-  const btnDownload = document.getElementById("btnDownload");
+  const btnCopyMd = document.getElementById("btnCopyMd");
+  const btnDownloadMd = document.getElementById("btnDownloadMd");
+  const btnDownloadRestoredZip = document.getElementById("btnDownloadRestoredZip");
+  const btnWriteToFolder = document.getElementById("btnWriteToFolder");
   const btnCancel = document.getElementById("btnCancel");
   const btnClearLog = document.getElementById("btnClearLog");
 
@@ -41,10 +45,11 @@
   const logSection = document.getElementById("logSection");
   const logBox = document.getElementById("logBox");
 
-  // 状態・メモリ管理用変数
+  // メモリ・状態管理
   let currentJob = null;
-  let resultBlob = null;       // 巨大文字列を保持せずBlobとして保持
-  let activeObjectUrl = null;  // ObjectURLのリーク防止管理
+  let resultMarkdownBlob = null; // 生成されたMarkdownのBlob
+  let restoredZipBlob = null;    // 復元されたZIPアーカイブのBlob
+  let activeObjectUrl = null;    // ObjectURLのリーク防止
   let currentRootName = "project";
 
   // ===================================================================
@@ -61,7 +66,8 @@
 
   function releaseOutputMemory() {
     revokeActiveObjectUrl();
-    resultBlob = null;
+    resultMarkdownBlob = null;
+    restoredZipBlob = null;
     currentRootName = "project";
     previewBox.textContent = "";
     previewBox.hidden = true;
@@ -72,7 +78,6 @@
     updateOutputButtonsState();
   }
 
-  // ページ離脱・アンロード時に確実にメモリとWorkerを破棄
   window.addEventListener("pagehide", () => {
     cancelActiveJob("PAGE_UNLOAD");
     releaseOutputMemory();
@@ -92,328 +97,80 @@
       logBox.removeChild(logBox.firstChild);
     }
     const line = document.createElement("div");
-    line.textContent = `[${new Date().toLocaleTimeString()}] ${msg}`;
+    line.textContent = `[${new Date().toLocaleTimeString()}]${msg}`;
     logBox.appendChild(line);
     logBox.scrollTop = logBox.scrollHeight;
   }
 
-  function updateStatsSummary(stats) {
+  function updateStatsSummary(stats, modeLabel = "変換") {
     if (!stats) {
       statBadge.textContent = "待機中";
       metaInfo.textContent = "まだファイルが読み込まれていません。";
       return;
     }
     const kb = ((stats.totalBytes || 0) / 1024).toFixed(1);
-    const tokens = (stats.estimatedTokens || 0).toLocaleString();
-    statBadge.textContent = `採用 ${stats.processedFiles || 0} 件 (${kb} KB)`;
-    metaInfo.textContent =
-      `走査: ${(stats.scannedEntries || 0).toLocaleString()}件 ｜ ` +
-      `採用: ${(stats.processedFiles || 0).toLocaleString()}件 ｜ ` +
-      `機密ファイル名除外: ${stats.secretFilesBlocked || 0}件 ｜ ` +
-      `本文機密除外: ${stats.contentSecretSkipped || 0}件 ｜ ` +
-      `マスク: ${stats.redactedSecretsCount || 0}箇所 ｜ ` +
-      `推定トークン: 約${tokens}`;
-  }
-
-  function updateOutputButtonsState() {
-    const canExport = Boolean(resultBlob) && confirmReviewedCheck.checked && !currentJob;
-    btnCopy.disabled = !canExport;
-    btnDownload.disabled = !canExport;
-  }
-
-  confirmReviewedCheck.addEventListener("change", updateOutputButtonsState);
-
-  function setUIIdleState(keepOutput) {
-    if (!keepOutput) {
-      releaseOutputMemory();
-      updateStatsSummary(null);
+    if (modeLabel === "復元") {
+      statBadge.textContent = `復元可能 ${stats.restoredFiles \vert{}\vert{} 0} 件 (${kb} KB)`;
+      metaInfo.textContent =
+        `モード: ディレクトリ復元 ｜ ` +
+        `ルート名: ${currentRootName} ｜ ` + `復元ファイル数: ${(stats.restoredFiles || 0).toLocaleString()}件 ｜ ` +
+        `サブディレクトリ数: ${(stats.restoredDirs \vert{}\vert{} 0).toLocaleString()}個 ｜ ` + `合計サイズ: ${kb} KB`;
     } else {
-      confirmReviewedCheck.disabled = false;
-      btnClearMemory.disabled = false;
-    }
-    btnSelectFolder.disabled = false;
-    btnSelectZip.disabled = false;
-    btnSelfTest.disabled = false;
-    btnCancel.disabled = true;
-    dropZone.classList.remove("disabled");
-    dropTitle.textContent = "📂 フォルダ または ZIPファイル をここにドロップ";
-    updateOutputButtonsState();
-  }
-
-  function setUIBusyState(statusText) {
-    releaseOutputMemory();
-    statBadge.textContent = "処理中...";
-    setStatus(statusText || "⏳ 安全に解析・検証しています...", false);
-
-    btnSelectFolder.disabled = true;
-    btnSelectZip.disabled = true;
-    btnSelfTest.disabled = true;
-    btnClearMemory.disabled = true;
-    btnCancel.disabled = false;
-    btnCopy.disabled = true;
-    btnDownload.disabled = true;
-
-    dropZone.classList.add("disabled");
-    dropTitle.textContent = statusText || "⏳ 解析中...";
-  }
-
-  // ===================================================================
-  // ジョブキャンセル・タイムアウト制御
-  // ===================================================================
-  function cancelActiveJob(reason = "JOB_CANCELLED") {
-    if (!currentJob) return false;
-    const job = currentJob;
-    currentJob = null;
-    if (job.abortController) {
-      job.abortController.abort();
-    }
-    if (job.cancelWorkerPromise) {
-      job.cancelWorkerPromise(new Error(reason));
-    }
-    return true;
-  }
-
-  function withAbortAndTimeout(promise, signal, deadline) {
-    return new Promise((resolve, reject) => {
-      if (signal.aborted) {
-        reject(new Error("JOB_CANCELLED"));
-        return;
-      }
-      const remaining = deadline - Date.now();
-      if (remaining <= 0) {
-        reject(new Error("フォルダ走査が制限時間(20秒)を超過しました。"));
-        return;
-      }
-
-      let settled = false;
-      const timer = setTimeout(() => {
-        if (!settled) {
-          settled = true;
-          signal.removeEventListener("abort", onAbort);
-          reject(new Error("フォルダ走査が制限時間(20秒)を超過しました。"));
-        }
-      }, remaining);
-
-      function onAbort() {
-        if (!settled) {
-          settled = true;
-          clearTimeout(timer);
-          reject(new Error("JOB_CANCELLED"));
-        }
-      }
-
-      signal.addEventListener("abort", onAbort, { once: true });
-
-      promise.then(
-        (val) => {
-          if (!settled) {
-            settled = true;
-            clearTimeout(timer);
-            signal.removeEventListener("abort", onAbort);
-            resolve(val);
-          }
-        },
-        (err) => {
-          if (!settled) {
-            settled = true;
-            clearTimeout(timer);
-            signal.removeEventListener("abort", onAbort);
-            reject(err);
-          }
-        }
-      );
-    });
-  }
-
-  async function traverseDirectorySafely(entries, signal, deadline) {
-    const collected = [];
-    let scannedCount = 0;
-
-    const excludeSet = new Set([
-      ".git", ".svn", ".hg", "node_modules", "venv", ".venv", "env",
-      "__pycache__", "build", "dist", "out", "target", ".idea", ".vscode", ".next"
-    ]);
-
-    async function walk(entry, pathPrefix, depth) {
-      if (signal.aborted) throw new Error("JOB_CANCELLED");
-      if (Date.now() > deadline) throw new Error("フォルダ走査が制限時間(20秒)を超過しました。");
-      if (depth > 25) return;
-
-      scannedCount++;
-      if (scannedCount > MAX_FOLDER_SCAN_ENTRIES) {
-        throw new Error(`フォルダ内の総エントリ数が上限(${MAX_FOLDER_SCAN_ENTRIES}件)を超えたため中断しました。`);
+      const tokens = (stats.estimatedTokens || 0).toLocaleString();
+      statBadge.textContent = `採用 ${stats.processedFiles \vert{}\vert{} 0} 件 (${kb} KB)`;
+      metaInfo.textContent =
+        `走査: ${(stats.scannedEntries \vert{}\vert{} 0).toLocaleString()}件 ｜ ` + `採用: ${(stats.processedFiles || 0).toLocaleString()}件 ｜ ` +
+        `機密除外: ${(stats.secretFilesBlocked \vert{}\vert{} 0) + (stats.contentSecretSkipped \vert{}\vert{} 0)}件 ｜ ` + `マスク: ${stats.redactedSecretsCount || 0}箇所 ｜ ` +
+        `推定トークン: 約${tokens}`; } }  function updateOutputButtonsState() { const confirmed = confirmReviewedCheck.checked && !currentJob; const canExportMd = Boolean(resultMarkdownBlob) && confirmed; const canRestore = (Boolean(restoredZipBlob) \vert{}\vert{} Boolean(resultMarkdownBlob)) && confirmed;  btnCopyMd.disabled = !canExportMd; btnDownloadMd.disabled = !canExportMd; btnDownloadRestoredZip.disabled = !canRestore; btnWriteToFolder.disabled = !canRestore \vert{}\vert{} typeof window.showDirectoryPicker !== "function"; }  confirmReviewedCheck.addEventListener("change", updateOutputButtonsState);  function setUIIdleState(keepOutput) { if (!keepOutput) { releaseOutputMemory(); updateStatsSummary(null); } else { confirmReviewedCheck.disabled = false; btnClearMemory.disabled = false; } btnSelectFolder.disabled = false; btnSelectZip.disabled = false; btnSelectMd.disabled = false; btnSelfTest.disabled = false; btnCancel.disabled = true; dropZone.classList.remove("disabled"); dropTitle.textContent = "📂 フォルダ / ZIP（変換）または .md（復元）をドロップ"; updateOutputButtonsState(); }  function setUIBusyState(statusText) { releaseOutputMemory(); statBadge.textContent = "処理中..."; setStatus(statusText \vert{}\vert{} "⏳ 安全に解析・検証しています...", false);  btnSelectFolder.disabled = true; btnSelectZip.disabled = true; btnSelectMd.disabled = true; btnSelfTest.disabled = true; btnClearMemory.disabled = true; btnCancel.disabled = false; updateOutputButtonsState();  dropZone.classList.add("disabled"); dropTitle.textContent = statusText \vert{}\vert{} "⏳ 解析中..."; }  // =================================================================== // ジョブキャンセル・タイムアウト制御 // =================================================================== function cancelActiveJob(reason = "JOB_CANCELLED") { if (!currentJob) return false; const job = currentJob; currentJob = null; if (job.abortController) { job.abortController.abort(); } if (job.cancelWorkerPromise) { job.cancelWorkerPromise(new Error(reason)); } return true; }  function withAbortAndTimeout(promise, signal, deadline) { return new Promise((resolve, reject) => { if (signal.aborted) { reject(new Error("JOB_CANCELLED")); return; } const remaining = deadline - Date.now(); if (remaining <= 0) { reject(new Error("処理が制限時間(20秒)を超過しました。")); return; }  let settled = false; const timer = setTimeout(() => { if (!settled) { settled = true; signal.removeEventListener("abort", onAbort); reject(new Error("処理が制限時間(20秒)を超過しました。")); } }, remaining);  function onAbort() { if (!settled) { settled = true; clearTimeout(timer); reject(new Error("JOB_CANCELLED")); } }  signal.addEventListener("abort", onAbort, { once: true });  promise.then( (val) => { if (!settled) { settled = true; clearTimeout(timer); signal.removeEventListener("abort", onAbort); resolve(val); } }, (err) => { if (!settled) { settled = true; clearTimeout(timer); signal.removeEventListener("abort", onAbort); reject(err); } } ); }); }  // =================================================================== // ① サブディレクトリ・相対パスを確実に保持するフォルダ走査＆正規化 // =================================================================== async function traverseDirectorySafely(entries, signal, deadline) { const collected = []; let scannedCount = 0;  const excludeSet = new Set([ ".git", ".svn", ".hg", "node_modules", "venv", ".venv", "env", "__pycache__", "build", "dist", "out", "target", ".idea", ".vscode", ".next" ]);  async function walk(entry, pathPrefix, depth) { if (signal.aborted) throw new Error("JOB_CANCELLED"); if (Date.now() > deadline) throw new Error("フォルダ走査が制限時間(20秒)を超過しました。"); if (depth > 25) return;  scannedCount++; if (scannedCount > MAX_FOLDER_SCAN_ENTRIES) { throw new Error(`フォルダ内の総エントリ数が上限(${MAX_FOLDER_SCAN_ENTRIES}件)を超えたため中断しました。`);
       }
       if (scannedCount % 150 === 0) {
-        statBadge.textContent = `走査中: ${scannedCount.toLocaleString()}件`;
-      }
+        statBadge.textContent = `走査中: ${scannedCount.toLocaleString()}件`; }  if (entry.isFile) { const fileObj = await withAbortAndTimeout( new Promise((resolve) => entry.file(resolve, () => resolve(null))), signal, deadline ); if (fileObj) { // entry.name ではなく pathPrefix + fileObj.name で確実にサブディレクトリ階層を連結 collected.push({ relPath: pathPrefix + fileObj.name, file: fileObj }); } } else if (entry.isDirectory) { if (excludeSet.has(entry.name.toLowerCase())) return; const reader = entry.createReader(); while (true) { const batch = await withAbortAndTimeout( new Promise((resolve) => reader.readEntries(resolve, () => resolve([]))), signal, deadline ); if (!batch \vert{}\vert{} batch.length === 0) break; for (const child of batch) { await walk(child, `${pathPrefix}${entry.name}/`, depth + 1); } } } }  for (const rootEntry of entries) { await walk(rootEntry, "", 0); } return collected; }  /** * 投入されたファイル群から共通ルートディレクトリを判定し、 * 配下のサブディレクトリ階層（例: src/sub/file.js）を100\%確実に保持して正規化する。 */ function normalizeRootAndSubpaths(rawItems, defaultRootName = "project") { const cleaned = []; for (const item of rawItems) { const norm = String(item.relPath \vert{}\vert{} "").replace(/\\/g, "/").replace(/^\/+/, ""); if (norm) { cleaned.push({ relPath: norm, file: item.file }); } } if (cleaned.length === 0) { return { rootName: defaultRootName, files: [] }; }  // すべてのファイルが単一の共通トップディレクトリ（例: "my-app/..."）配下にあるか判定 const firstParts = cleaned[0].relPath.split("/"); if (firstParts.length > 1) { const candidateRoot = firstParts[0]; const prefix = candidateRoot + "/"; const allShareRoot = cleaned.every((it) => it.relPath.startsWith(prefix) && it.relPath.length > prefix.length); if (allShareRoot) { return { rootName: candidateRoot, files: cleaned.map((it) => ({ relPath: it.relPath.slice(prefix.length), file: it.file })) }; } }  return { rootName: defaultRootName, files: cleaned }; }  // =================================================================== // Worker 通信ラッパー // =================================================================== function runWorkerTask(payload, transferList = [], jobContext = null) { return new Promise((resolve, reject) => { let settled = false; let worker = null;  try { worker = new Worker("./worker.js"); } catch (_) { reject(new Error("Workerの起動に失敗しました（ローカル実行時はHTTPサーバー経由で開いてください）。")); return; }  function finalize() { if (worker) { worker.onmessage = null; worker.onerror = null; worker.terminate(); worker = null; } if (jobContext && jobContext.cancelWorkerPromise) { jobContext.cancelWorkerPromise = null; } }  function settleResolve(val) { if (settled) return; settled = true; finalize(); resolve(val); }  function settleReject(err) { if (settled) return; settled = true; finalize(); reject(err); }  if (jobContext) { if (jobContext.abortController && jobContext.abortController.signal.aborted) { settleReject(new Error("JOB_CANCELLED")); return; } jobContext.cancelWorkerPromise = settleReject; }  worker.onmessage = (e) => { if (settled) return; const data = e.data; if (data.type === "progress") { updateStatsSummary(data.stats); } else if (data.type === "complete" \vert{}\vert{} data.type === "restore_complete") { settleResolve(data); } else if (data.type === "error") { settleReject(new Error(data.message)); } };  worker.onerror = (err) => { settleReject(new Error(err.message \vert{}\vert{} "Worker実行中にエラーが発生しました。")); };  worker.postMessage(payload, transferList); }); }  // =================================================================== // パック処理（フォルダ / ZIP ➔ Markdown） // =================================================================== async function executePackingJob(payload, transferList = [], existingJob = null) { const job = existingJob \vert{}\vert{} { abortController: new AbortController(), cancelWorkerPromise: null }; currentJob = job;  try { payload.options = { secretMode: secretModeSelect.value, includeBoundary: boundarySelect.value === "on" };  let result = await runWorkerTask(payload, transferList, job); if (currentJob === job) { currentJob = null; }  currentRootName = result.rootName \vert{}\vert{} "project"; updateStatsSummary(result.stats, "変換");  const totalChars = result.markdown.length; const previewSlice = result.markdown.slice(0, PREVIEW_MAX_CHARS); resultMarkdownBlob = new Blob([result.markdown], { type: "text/markdown;charset=utf-8" }); result.markdown = "";  emptyState.hidden = true; previewBox.hidden = false; previewBox.textContent = previewSlice + (totalChars > PREVIEW_MAX_CHARS ? `\n\n... (以降 ${(totalChars - PREVIEW_MAX_CHARS).toLocaleString()} 文字省略。保存またはコピーで全文を取得できます)`
+          : "");
 
-      if (entry.isFile) {
-        const fileObj = await withAbortAndTimeout(
-          new Promise((resolve) => entry.file(resolve, () => resolve(null))),
-          signal,
-          deadline
-        );
-        if (fileObj) {
-          collected.push({ relPath: pathPrefix + fileObj.name, file: fileObj });
-        }
-      } else if (entry.isDirectory) {
-        if (excludeSet.has(entry.name.toLowerCase())) return;
-        const reader = entry.createReader();
-        while (true) {
-          const batch = await withAbortAndTimeout(
-            new Promise((resolve) => reader.readEntries(resolve, () => resolve([]))),
-            signal,
-            deadline
-          );
-          if (!batch || batch.length === 0) break;
-          for (const child of batch) {
-            await walk(child, `${pathPrefix}${entry.name}/`, depth + 1);
-          }
-        }
-      }
-    }
+      setUIIdleState(true);
+      setStatus(`✅ Markdown生成完了: サブディレクトリ構造を保持して ${result.stats.processedFiles} 件をパックしました。`, false);  if (result.stats.warnings && result.stats.warnings.length > 0) { appendLog(`🛡️ 保護・除外ログ (${result.stats.warnings.length}件):`);
+        for (const w of result.stats.warnings.slice(0, 25)) {
+          appendLog(`  ・${w}`); } } result = null; } catch (err) { if (currentJob === job) currentJob = null; setUIIdleState(false); if (err.message === "JOB_CANCELLED") { setStatus("🛑 処理を中断し、メモリを解放しました。", false); } else { setStatus(`❌ エラー: ${err.message}`, true);
+        appendLog(`❌ 中断・エラー: ${err.message}`); } } }  // =================================================================== // ② 復元処理（Markdown ➔ 元のディレクトリ構造 & ZIPバイナリ生成） // =================================================================== async function handleMarkdownRestoreFile(file) { if (file.size > 45 * 1024 * 1024) { setStatus("❌ Markdownファイルサイズが上限(45MB)を超えています。", true); return; } setUIBusyState(`⏳ Markdown (${file.name}) からディレクトリ構造を解析・復元中...`);
 
-    for (const rootEntry of entries) {
-      await walk(rootEntry, "", 0);
-    }
-    return collected;
-  }
-
-  // ===================================================================
-  // Worker 実行と厳格なリソース解放
-  // ===================================================================
-  function runWorkerTask(payload, transferList = [], jobContext = null) {
-    return new Promise((resolve, reject) => {
-      let settled = false;
-      let worker = null;
-
-      try {
-        worker = new Worker("./worker.js");
-      } catch (_) {
-        reject(new Error("Workerの起動に失敗しました（ローカル実行時はHTTPサーバー経由で開いてください）。"));
-        return;
-      }
-
-      function finalize() {
-        if (worker) {
-          worker.onmessage = null;
-          worker.onerror = null;
-          worker.terminate();
-          worker = null;
-        }
-        if (jobContext && jobContext.cancelWorkerPromise) {
-          jobContext.cancelWorkerPromise = null;
-        }
-      }
-
-      function settleResolve(val) {
-        if (settled) return;
-        settled = true;
-        finalize();
-        resolve(val);
-      }
-
-      function settleReject(err) {
-        if (settled) return;
-        settled = true;
-        finalize();
-        reject(err);
-      }
-
-      if (jobContext) {
-        if (jobContext.abortController && jobContext.abortController.signal.aborted) {
-          settleReject(new Error("JOB_CANCELLED"));
-          return;
-        }
-        jobContext.cancelWorkerPromise = settleReject;
-      }
-
-      worker.onmessage = (e) => {
-        if (settled) return;
-        const data = e.data;
-        if (data.type === "progress") {
-          updateStatsSummary(data.stats);
-        } else if (data.type === "complete") {
-          settleResolve(data);
-        } else if (data.type === "error") {
-          settleReject(new Error(data.message));
-        }
-      };
-
-      worker.onerror = (err) => {
-        settleReject(new Error(err.message || "Worker実行中にエラーが発生しました。"));
-      };
-
-      worker.postMessage(payload, transferList);
-    });
-  }
-
-  async function executePackingJob(payload, transferList = [], existingJob = null) {
-    const job = existingJob || { abortController: new AbortController(), cancelWorkerPromise: null };
+    const job = { abortController: new AbortController(), cancelWorkerPromise: null };
     currentJob = job;
 
     try {
-      payload.options = {
-        secretMode: secretModeSelect.value,
-        includeBoundary: boundarySelect.value === "on"
-      };
+      const mdText = await withAbortAndTimeout(
+        file.text(),
+        job.abortController.signal,
+        Date.now() + SCAN_TIMEOUT_MS
+      );
 
-      let result = await runWorkerTask(payload, transferList, job);
-      if (currentJob === job) {
-        currentJob = null;
-      }
+      let res = await runWorkerTask({ mode: "restore_zip", markdownText: mdText }, [], job);
+      if (currentJob === job) currentJob = null;
 
-      currentRootName = result.rootName || "project";
-      updateStatsSummary(result.stats);
+      currentRootName = res.rootName || "restored_project";
+      restoredZipBlob = new Blob([res.zipBuffer], { type: "application/zip" });
+      resultMarkdownBlob = new Blob([mdText], { type: "text/markdown;charset=utf-8" });
 
-      // 省メモリ設計: 長大な文字列は即座にBlobへ変換し、文字列参照(result.markdown)を破棄してGC対象にする
-      const totalChars = result.markdown.length;
-      const previewSlice = result.markdown.slice(0, PREVIEW_MAX_CHARS);
-      resultBlob = new Blob([result.markdown], { type: "text/markdown;charset=utf-8" });
-      result.markdown = ""; // 文字列参照を即座に切る
+      updateStatsSummary(res.stats, "復元");
 
       emptyState.hidden = true;
       previewBox.hidden = false;
       previewBox.textContent =
-        previewSlice +
-        (totalChars > PREVIEW_MAX_CHARS
-          ? `\n\n... (以降 ${(totalChars - PREVIEW_MAX_CHARS).toLocaleString()} 文字省略。保存またはコピーで全文を取得できます)`
-          : "");
+        `【復元プレビュー: ルートフォルダ "${currentRootName}/"】\n` + `以下のサブディレクトリ・相対パス構造（全 ${res.stats.restoredFiles} ファイル）が検証され、復元準備が完了しました:\n\n` +
+        res.treePreview +
+        "\n\n--- 復元ファイル一覧 (相対パス / サイズ / CRC-32検証) ---\n" +
+        res.fileSummaryLines.join("\n");
 
       setUIIdleState(true);
-      setStatus(`✅ 解析完了: ${result.stats.processedFiles}件のファイルを安全にパックしました。`, false);
+      setStatus(
+        `✅ 復元準備完了: ${res.stats.restoredFiles}件のファイル（${res.stats.restoredDirs}個のサブディレクトリ）を元の構造に復元できます。`,
+        false
+      );
 
-      if (result.stats.warnings && result.stats.warnings.length > 0) {
-        appendLog(`🛡️ 保護・除外ログ (${result.stats.warnings.length}件):`);
-        for (const w of result.stats.warnings.slice(0, 25)) {
-          appendLog(`  ・${w}`);
-        }
-        if (result.stats.warnings.length > 25) {
-          appendLog(`  ...他 ${result.stats.warnings.length - 25} 件の除外ログ`);
-        }
-      }
-      result = null;
-    } catch (err) {
-      if (currentJob === job) {
-        currentJob = null;
-      }
-      setUIIdleState(false);
-      if (err.message === "JOB_CANCELLED") {
-        setStatus("🛑 処理を中断し、Workerおよびメモリを解放しました。", false);
-      } else {
-        setStatus(`❌ エラー: ${err.message}`, true);
-        appendLog(`❌ 中断・エラー: ${err.message}`);
-      }
-    }
-  }
-
-  async function handleZipFile(file) {
-    if (file.size > 50 * 1024 * 1024) {
-      setStatus("❌ ZIP圧縮サイズが上限(50MB)を超えているため拒否しました。", true);
-      return;
-    }
-    const rootName = file.name.replace(/\.zip$/i, "");
-    setUIBusyState(`⏳ ZIP (${file.name}) の構造・CRC-32・ストリーム検証中...`);
+      if (res.stats.warnings && res.stats.warnings.length > 0) {
+        for (const w of res.stats.warnings) {
+          appendLog(`🛡️ [復元監査] ${w}`); } } res = null; } catch (err) { if (currentJob === job) currentJob = null; setUIIdleState(false); if (err.message === "JOB_CANCELLED") { setStatus("🛑 復元処理をキャンセルしました。", false); } else { setStatus(`❌ Markdown復元エラー: ${err.message}`, true);
+        appendLog(`❌ 復元失敗: ${err.message}`); } } }  // 生成直後のMarkdownからでもオンデマンドでZIP復元できるヘルパー async function ensureRestoredZipBlob() { if (restoredZipBlob) return restoredZipBlob; if (!resultMarkdownBlob) throw new Error("復元元のMarkdownデータがありません。");  setStatus("⏳ Markdownから元のディレクトリ構造(ZIP)を構築しています...", false); const mdText = await resultMarkdownBlob.text(); const res = await runWorkerTask({ mode: "restore_zip", markdownText: mdText }); currentRootName = res.rootName \vert{}\vert{} currentRootName; restoredZipBlob = new Blob([res.zipBuffer], { type: "application/zip" }); return restoredZipBlob; }  // ローカルフォルダへの直接展開（File System Access API） async function writeRestoredFilesToDirectory() { if (typeof window.showDirectoryPicker !== "function") { setStatus("❌ お使いのブラウザはフォルダ直接書込に非対応です。「ZIPで保存」をご利用ください。", true); return; } if (!resultMarkdownBlob) return;  try { const parentDirHandle = await window.showDirectoryPicker({ mode: "readwrite" }); setStatus("⏳ Markdownを解析し、ローカルフォルダへサブディレクトリ構造を展開中...", false);  const mdText = await resultMarkdownBlob.text(); const res = await runWorkerTask({ mode: "restore_files", markdownText: mdText });  const safeRoot = (res.rootName \vert{}\vert{} "restored_project").replace(/[^a-zA-Z0-9._-]/g, "_") \vert{}\vert{} "restored_project"; // 既存ファイルを上書きしないようプロジェクトルート用サブフォルダを作成 const rootDirHandle = await parentDirHandle.getDirectoryHandle(safeRoot, { create: true });  let writtenCount = 0; for (const fileEntry of res.files) { const parts = fileEntry.relPath.split("/"); let currDir = rootDirHandle; // サブディレクトリを順次作成 for (let i = 0; i < parts.length - 1; i++) { currDir = await currDir.getDirectoryHandle(parts[i], { create: true }); } const fileName = parts[parts.length - 1]; const fileHandle = await currDir.getFileHandle(fileName, { create: true }); const writable = await fileHandle.createWritable(); await writable.write(fileEntry.bytes); await writable.close(); writtenCount++; }  setStatus(`✅ ローカルフォルダ「${safeRoot}/」配下に全 ${writtenCount} 件のファイルを元の階層通りに復元しました。`, false); appendLog(`📂 実フォルダ展開完了: ${safeRoot}/ (${writtenCount}件)`); } catch (err) { if (err && err.name === "AbortError") { setStatus("🛑 フォルダ選択がキャンセルされました。", false); } else { setStatus(`❌ フォルダ直接展開エラー: ${err.message}`, true);
+        appendLog(`❌ フォルダ展開失敗: ${err.message}`); } } }  async function handleZipFile(file) { if (file.size > 50 * 1024 * 1024) { setStatus("❌ ZIP圧縮サイズが上限(50MB)を超えているため拒否しました。", true); return; } const rootName = file.name.replace(/\.zip$/i, ""); setUIBusyState(`⏳ ZIP (${file.name}) の構造・CRC-32・ストリーム検証中...`);
 
     const job = { abortController: new AbortController(), cancelWorkerPromise: null };
     currentJob = job;
@@ -424,7 +181,6 @@
         job.abortController.signal,
         Date.now() + SCAN_TIMEOUT_MS
       );
-      // zipBufferをTransferableとしてWorkerへ完全移譲（メインスレッド側のメモリ消費をゼロ化）
       await executePackingJob({ mode: "zip", rootName, zipBuffer }, [zipBuffer], job);
     } catch (err) {
       if (currentJob === job) currentJob = null;
@@ -432,80 +188,14 @@
       if (err.message === "JOB_CANCELLED") {
         setStatus("🛑 ZIP読込をキャンセルしました。", false);
       } else {
-        setStatus(`❌ ZIP読込失敗: ${err.message}`, true);
-      }
-    }
-  }
-
-  // ===================================================================
-  // イベントリスナー登録
-  // ===================================================================
-  dropZone.addEventListener("dragover", (e) => {
-    e.preventDefault();
-    if (!currentJob) dropZone.classList.add("dragover");
-  });
-
-  dropZone.addEventListener("dragleave", () => dropZone.classList.remove("dragover"));
-
-  dropZone.addEventListener("drop", async (e) => {
-    e.preventDefault();
-    dropZone.classList.remove("dragover");
-    if (currentJob) return;
-
-    const items = e.dataTransfer.items;
-    if (!items || items.length === 0) return;
-
-    if (items.length === 1) {
-      const singleFile = items[0].getAsFile();
-      if (singleFile && singleFile.name.toLowerCase().endsWith(".zip")) {
-        await handleZipFile(singleFile);
-        return;
-      }
-    }
-
-    const entries = [];
-    for (let i = 0; i < items.length; i++) {
-      const entry = items[i].webkitGetAsEntry ? items[i].webkitGetAsEntry() : null;
-      if (entry) entries.push(entry);
-    }
-    if (entries.length === 0) return;
-
-    setUIBusyState("⏳ フォルダ階層を走査中...");
-    const job = { abortController: new AbortController(), cancelWorkerPromise: null };
-    currentJob = job;
-
-    try {
-      let allFiles = await traverseDirectorySafely(
-        entries,
-        job.abortController.signal,
-        Date.now() + SCAN_TIMEOUT_MS
-      );
-
-      const rootName = entries.length === 1 ? entries[0].name : "workspace";
-      if (entries.length === 1 && entries[0].isDirectory) {
-        const prefix = entries[0].name + "/";
-        allFiles = allFiles.map((item) => ({
-          relPath: item.relPath.startsWith(prefix) ? item.relPath.slice(prefix.length) : item.relPath,
-          file: item.file
-        }));
-      }
-
-      setStatus("⏳ Workerでファイル内容と機密情報を検査中...", false);
-      await executePackingJob({ mode: "files", rootName, files: allFiles }, [], job);
-    } catch (err) {
-      if (currentJob === job) currentJob = null;
-      setUIIdleState(false);
-      if (err.message === "JOB_CANCELLED") {
-        setStatus("🛑 フォルダ走査をキャンセルしました。", false);
-      } else {
-        setStatus(`❌ 走査中断: ${err.message}`, true);
+        setStatus(`❌ ZIP読込失敗: ${err.message}`, true); } } }  // =================================================================== // イベントリスナー登録 // =================================================================== dropZone.addEventListener("dragover", (e) => { e.preventDefault(); if (!currentJob) dropZone.classList.add("dragover"); });  dropZone.addEventListener("dragleave", () => dropZone.classList.remove("dragover"));  dropZone.addEventListener("drop", async (e) => { e.preventDefault(); dropZone.classList.remove("dragover"); if (currentJob) return;  const items = e.dataTransfer.items; if (!items \vert{}\vert{} items.length === 0) return;  // 単一ファイルのドロップ時：.zip または 復元用 .md の自動判定 if (items.length === 1) { const entry = items[0].webkitGetAsEntry ? items[0].webkitGetAsEntry() : null; if (!entry \vert{}\vert{} entry.isFile) { const singleFile = items[0].getAsFile(); if (singleFile) { const lowerName = singleFile.name.toLowerCase(); if (lowerName.endsWith(".zip")) { await handleZipFile(singleFile); return; } if (lowerName.endsWith(".md") \vert{}\vert{} lowerName.endsWith(".markdown")) { await handleMarkdownRestoreFile(singleFile); return; } } } }  const entries = []; for (let i = 0; i < items.length; i++) { const entry = items[i].webkitGetAsEntry ? items[i].webkitGetAsEntry() : null; if (entry) entries.push(entry); } if (entries.length === 0) return;  setUIBusyState("⏳ フォルダ階層とサブディレクトリを走査中..."); const job = { abortController: new AbortController(), cancelWorkerPromise: null }; currentJob = job;  try { const rawCollected = await traverseDirectorySafely( entries, job.abortController.signal, Date.now() + SCAN_TIMEOUT_MS );  const defaultRoot = entries.length === 1 && entries[0].isDirectory ? entries[0].name : "workspace"; const normalized = normalizeRootAndSubpaths(rawCollected, defaultRoot);  setStatus("⏳ Workerでサブディレクトリ構造とファイル内容を検査中...", false); await executePackingJob( { mode: "files", rootName: normalized.rootName, files: normalized.files }, [], job ); } catch (err) { if (currentJob === job) currentJob = null; setUIIdleState(false); if (err.message === "JOB_CANCELLED") { setStatus("🛑 フォルダ走査をキャンセルしました。", false); } else { setStatus(`❌ 走査中断: ${err.message}`, true);
       }
     }
   });
 
   dropZone.addEventListener("click", (e) => {
     if (currentJob) return;
-    if (e.target === folderInput || e.target === zipInput) return;
+    if (e.target === folderInput || e.target === zipInput || e.target === mdRestoreInput) return;
     folderInput.click();
   });
 
@@ -519,6 +209,7 @@
 
   btnSelectFolder.addEventListener("click", () => folderInput.click());
   btnSelectZip.addEventListener("click", () => zipInput.click());
+  btnSelectMd.addEventListener("click", () => mdRestoreInput.click());
 
   folderInput.addEventListener("change", async (e) => {
     const rawList = e.target.files;
@@ -530,29 +221,31 @@
       return;
     }
 
-    const firstPath = rawList[0].webkitRelativePath || rawList[0].name;
-    const rootName = firstPath.includes("/") ? firstPath.split("/")[0] : "project";
-    const prefix = rootName + "/";
-
-    const files = [];
+    const rawItems = [];
     for (let i = 0; i < rawList.length; i++) {
       const f = rawList[i];
-      const rawRel = f.webkitRelativePath || f.name;
-      files.push({
-        relPath: rawRel.startsWith(prefix) ? rawRel.slice(prefix.length) : rawRel,
+      rawItems.push({
+        relPath: f.webkitRelativePath || f.name,
         file: f
       });
     }
     folderInput.value = "";
 
-    setUIBusyState(`⏳ フォルダ (${rootName}: ${files.length}件) を検査中...`);
-    await executePackingJob({ mode: "files", rootName, files });
+    const normalized = normalizeRootAndSubpaths(rawItems, "project");
+    setUIBusyState(`⏳ フォルダ (${normalized.rootName}:${normalized.files.length}件) を検査中...`);
+    await executePackingJob({ mode: "files", rootName: normalized.rootName, files: normalized.files });
   });
 
   zipInput.addEventListener("change", async (e) => {
     const file = e.target.files && e.target.files[0];
     zipInput.value = "";
     if (file) await handleZipFile(file);
+  });
+
+  mdRestoreInput.addEventListener("change", async (e) => {
+    const file = e.target.files && e.target.files[0];
+    mdRestoreInput.value = "";
+    if (file) await handleMarkdownRestoreFile(file);
   });
 
   btnCancel.addEventListener("click", () => {
@@ -570,37 +263,36 @@
     logSection.hidden = true;
   });
 
-  btnCopy.addEventListener("click", async () => {
-    if (!resultBlob || !confirmReviewedCheck.checked) return;
+  btnCopyMd.addEventListener("click", async () => {
+    if (!resultMarkdownBlob || !confirmReviewedCheck.checked) return;
     try {
-      const text = await resultBlob.text();
+      const text = await resultMarkdownBlob.text();
       await navigator.clipboard.writeText(text);
       setStatus("📋 確認済みMarkdownをクリップボードにコピーしました。", false);
     } catch (err) {
-      setStatus(`❌ コピー失敗: ${err.message}`, true);
-    }
-  });
-
-  btnDownload.addEventListener("click", () => {
-    if (!resultBlob || !confirmReviewedCheck.checked) return;
-    revokeActiveObjectUrl();
-    const safeName = currentRootName.replace(/[^a-zA-Z0-9_-]/g, "_") || "project";
-    activeObjectUrl = URL.createObjectURL(resultBlob);
-
-    const a = document.createElement("a");
-    a.href = activeObjectUrl;
-    a.download = `${safeName}_gemini_context.md`;
+      setStatus(`❌ コピー失敗: ${err.message}`, true); } });  btnDownloadMd.addEventListener("click", () => { if (!resultMarkdownBlob \vert{}\vert{} !confirmReviewedCheck.checked) return; revokeActiveObjectUrl(); const safeName = currentRootName.replace(/[^a-zA-Z0-9_-]/g, "_") \vert{}\vert{} "project"; activeObjectUrl = URL.createObjectURL(resultMarkdownBlob);  const a = document.createElement("a"); a.href = activeObjectUrl; a.download = `${safeName}_gemini_context.md`;
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
 
-    // ダウンロード開始後、10秒で確実にURL参照を解放
     setTimeout(revokeActiveObjectUrl, 10000);
-    setStatus(`💾 ${safeName}_gemini_context.md を保存しました。`, false);
+    setStatus(`💾 ${safeName}_gemini_context.md を保存しました。`, false); });  btnDownloadRestoredZip.addEventListener("click", async () => { if (!confirmReviewedCheck.checked) return; try { const zipBlob = await ensureRestoredZipBlob(); revokeActiveObjectUrl(); const safeName = currentRootName.replace(/[^a-zA-Z0-9_-]/g, "_") \vert{}\vert{} "restored_project"; activeObjectUrl = URL.createObjectURL(zipBlob);  const a = document.createElement("a"); a.href = activeObjectUrl; a.download = `${safeName}_restored.zip`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+
+      setTimeout(revokeActiveObjectUrl, 10000);
+      setStatus(`🗜️ 元のディレクトリ構造を保持した ${safeName}_restored.zip を保存しました。`, false); } catch (err) { setStatus(`❌ ZIP復元エラー: ${err.message}`, true);
+    }
+  });
+
+  btnWriteToFolder.addEventListener("click", async () => {
+    if (!confirmReviewedCheck.checked) return;
+    await writeRestoredFilesToDirectory();
   });
 
   // ===================================================================
-  // 全12項目の厳格セキュリティ自己診断スイート
+  // 全13項目の厳格セキュリティ＆往復ディレクトリ復元自己診断スイート
   // ===================================================================
   const TEST_CRC_TABLE = (() => {
     const table = new Uint32Array(256);
@@ -718,13 +410,13 @@
   btnSelfTest.addEventListener("click", async () => {
     if (currentJob) return;
     logBox.textContent = "";
-    setUIBusyState("🧪 厳格セキュリティ自己診断 (12項目) を実行中...");
-    appendLog("=== 🧪 厳格セキュリティ自己診断スイート (全12項目) 開始 ===");
+    setUIBusyState("🧪 厳格セキュリティ＆往復復元テスト (全13項目) を実行中...");
+    appendLog("=== 🧪 厳格セキュリティ＆往復ディレクトリ復元テスト (全13項目) 開始 ===");
 
     const results = [];
-    async function expectReject(testName, zipBuf, expectedSubstr) {
+    async function expectReject(testName, payload, transfer, expectedSubstr) {
       try {
-        await runWorkerTask({ mode: "zip", rootName: "test", zipBuffer: zipBuf }, [zipBuf]);
+        await runWorkerTask(payload, transfer);
         results.push({ name: testName, pass: false, detail: "拒否されず通過" });
       } catch (err) {
         const matched = !expectedSubstr || err.message.includes(expectedSubstr);
@@ -734,19 +426,19 @@
 
     try {
       const badCdZip = buildCustomTestZip([{ name: "a.py", data: "x=1" }], { corruptCdSize: 99999 });
-      await expectReject("1. Central Directory 境界逸脱の拒否", badCdZip, "Central Directory");
+      await expectReject("1. Central Directory 境界逸脱の拒否", { mode: "zip", rootName: "t", zipBuffer: badCdZip }, [badCdZip], "Central Directory");
 
       const mismatchZip = buildCustomTestZip([{ name: "safe.py", lfhName: "evil.py", data: "x=1" }]);
-      await expectReject("2. LFH/CD ヘッダ不整合の拒否", mismatchZip, "矛盾");
+      await expectReject("2. LFH/CD ヘッダ不整合の拒否", { mode: "zip", rootName: "t", zipBuffer: mismatchZip }, [mismatchZip], "矛盾");
 
       const overlapZip = buildCustomTestZip([
         { name: "a.py", data: "print(1)" },
         { name: "b.py", data: "print(1)", forceLhOffset: 0, skipLocalHeaderWrite: true }
       ]);
-      await expectReject("3. エントリ領域重複(Overlap)の拒否", overlapZip, "Overlap");
+      await expectReject("3. エントリ領域重複(Overlap)の拒否", { mode: "zip", rootName: "t", zipBuffer: overlapZip }, [overlapZip], "Overlap");
 
       const badCrcZip = buildCustomTestZip([{ name: "corrupt.py", data: "print('hello')", customCrc: 0x12345678 }]);
-      await expectReject("4. CRC-32 不一致（改ざん）の拒否", badCrcZip, "CRC_MISMATCH");
+      await expectReject("4. CRC-32 不一致（改ざん）の拒否", { mode: "zip", rootName: "t", zipBuffer: badCrcZip }, [badCrcZip], "CRC_MISMATCH");
 
       const bombPayload = new Uint8Array(20 * 1024).fill(65);
       const compressedBomb = await deflateRawBytes(bombPayload);
@@ -844,22 +536,54 @@
         detail: `バジェット停止=${budgetPassed}, キャンセル即時決済=${cancelSettled}`
       });
 
-      let allPassed = true;
-      for (const r of results) {
-        appendLog(`${r.pass ? "✅ PASS" : "❌ FAIL"} : ${r.name} (${r.detail})`);
-        if (!r.pass) allPassed = false;
+      // テスト13: サブディレクトリ階層保持 ＆ Markdownからの完全往復復元 (Round-Trip) 検証 + 悪意あるMarkdownパスの遮断
+      const roundTripInputZip = buildCustomTestZip([
+        { name: "src/core/engine.js", data: "export const run = () => {\n  return 'ok';\n};\n" },
+        { name: "src/ui/components/Header.tsx", data: "// Header\nexport default function Header() { return <div/>; }\n" },
+        { name: "docs/guide/nested/README.md", data: "# Nested Guide\n### File: `fake/spoof.js`\n```js\nconsole.log('nested fence');\n```\n" }
+      ]);
+
+      // Step A: ZIP -> Markdown
+      const packedRes = await runWorkerTask(
+        { mode: "zip", rootName: "my_webapp", zipBuffer: roundTripInputZip },
+        [roundTripInputZip]
+      );
+      // Step B: Markdown -> ZIP 復元
+      const restoredZipRes = await runWorkerTask({
+        mode: "restore_zip",
+        markdownText: packedRes.markdown
+      });
+      // Step C: 復元されたZIPを再度ZIPパーサーで展開して、元の相対パス＆本文と100%一致するか検証
+      const repackedRes = await runWorkerTask(
+        { mode: "zip", rootName: restoredZipRes.rootName, zipBuffer: restoredZipRes.zipBuffer },
+        [restoredZipRes.zipBuffer]
+      );
+
+      // Step D: 悪意あるパストラバーサルやWindows予約名を含むMarkdownの復元拒否テスト
+      const maliciousMd =
+        "# Project Context for Gemini\n\n### File: `../../evil.sh`\n\n```sh\nrm -rf /\n```\n";
+      let traversalBlocked = false;
+      try {
+        await runWorkerTask({ mode: "restore_zip", markdownText: maliciousMd });
+      } catch (_) {
+        traversalBlocked = true;
       }
 
-      setUIIdleState(false);
-      setStatus(
-        allPassed
-          ? "🎉 全12項目の厳格セキュリティ自己診断にすべて合格しました。"
-          : "⚠️ 一部の自己診断項目が失敗しました。ログを確認してください。",
-        !allPassed
-      );
-    } catch (err) {
-      setUIIdleState(false);
-      setStatus(`❌ 自己診断エラー: ${err.message}`, true);
+      const roundTripPass =
+        restoredZipRes.rootName === "my_webapp" &&
+        restoredZipRes.stats.restoredFiles === 3 &&
+        repackedRes.markdown === packedRes.markdown &&
+        traversalBlocked;
+
+      results.push({
+        name: "13. サブディレクトリ保持 ＆ Markdownからの完全往復復元 (Round-Trip) 検証",
+        pass: roundTripPass,
+        detail: `3階層サブディレクトリ完全一致=${repackedRes.markdown === packedRes.markdown}, 不正パス復元遮断=${traversalBlocked}`
+      });
+
+      let allPassed = true;
+      for (const r of results) {
+        appendLog(`${r.pass ? "✅ PASS" : "❌ FAIL"} : ${r.name} (${r.detail})`); if (!r.pass) allPassed = false; }  setUIIdleState(false); setStatus( allPassed ? "🎉 全13項目（サブディレクトリ保持＆往復復元を含む）の検証にすべて合格しました。" : "⚠️ 一部の検証項目が失敗しました。ログを確認してください。", !allPassed ); } catch (err) { setUIIdleState(false); setStatus(`❌ 自己診断エラー: ${err.message}`, true);
     }
   });
 })();
