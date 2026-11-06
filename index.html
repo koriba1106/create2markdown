@@ -3,159 +3,177 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <!-- Strict CSP: 外部通信・インラインスクリプト・インラインスタイルを完全遮断 -->
+  <meta name="theme-color" content="#f5f6f0">
   <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; worker-src 'self'; connect-src 'none'; img-src 'self' data:; object-src 'none'; base-uri 'none'; form-action 'none';">
-  <title>Secure Gemini Code Packer &amp; Restorer</title>
+  <meta name="description" content="ローカルで安全にプロジェクトをMarkdown化し、元のディレクトリ構造へ復元するツールです。">
+  <title>Secure Gemini Code Packer</title>
   <link rel="stylesheet" href="./style.css">
 </head>
 <body>
-
-<div id="frameBlocked" class="frame-blocked" hidden>
-  ⚠️ セキュリティ保護のため、フレーム（iframe）内での実行はブロックされました。直接ウィンドウで開いてください。
-</div>
-
-<div id="appRoot" class="app">
-  <header>
-    <div class="brand">
-      <div class="mark" aria-hidden="true">📦</div>
-      <div>
-        <h1>Secure Gemini Code Packer</h1>
-        <p>サブディレクトリ完全保持 ＆ Markdownからのディレクトリ構造復元に対応</p>
-      </div>
-    </div>
-    <div class="header-actions">
-      <button id="btnSelfTest" class="subtle" type="button">🧪 自己診断 (全13項目・往復復元検証)</button>
-      <button id="btnClearMemory" class="subtle" type="button" disabled>🧹 メモリ解放・クリア</button>
-    </div>
-  </header>
-
-  <div class="steps" aria-label="主な機能">
-    <span class="step">① フォルダ / ZIP ➔ Markdown変換（相対パス保持）</span>
-    <span class="step">② Markdown (.md) ➔ 元のディレクトリ構造へ完全復元</span>
+  <div id="frameBlocked" class="frame-blocked" hidden>
+    セキュリティ保護のため、フレーム（iframe）内での実行はブロックされました。直接ウィンドウで開いてください。
   </div>
 
-  <main class="layout">
-    <!-- 左カラム：ファイル投入 ＆ プレビュー -->
-    <section class="panel" aria-labelledby="panelInputTitle">
-      <div class="panel-head">
-        <h2 id="panelInputTitle">入力ドロップゾーン ＆ プレビュー</h2>
-        <span id="statBadge" class="badge">待機中</span>
-      </div>
-
-      <div id="dropZone" class="file-zone" tabindex="0" role="button" aria-label="フォルダ、ZIP、または復元用Markdownファイルをドロップ">
-        <span id="dropTitle">📂 フォルダ / ZIP（変換）または .md（復元）をドロップ</span>
-        <small>フォルダ・ZIPを入れるとMarkdownを生成 ／ 生成済み .md ファイルを入れると元の階層構造に復元します</small>
-        <input type="file" id="folderInput" webkitdirectory directory multiple tabindex="-1">
-        <input type="file" id="zipInput" accept=".zip,application/zip" tabindex="-1">
-        <input type="file" id="mdRestoreInput" accept=".md,.markdown,text/markdown,text/plain" tabindex="-1">
-      </div>
-
-      <p id="metaInfo" class="meta">
-        まだファイルが読み込まれていません。下のボタンまたはドラッグ＆ドロップで開始してください。
-      </p>
-
-      <div class="preview" aria-live="polite">
-        <div id="emptyState" class="empty">
-          <strong>プレビュー待機中</strong>
-          <span>変換時はMarkdownプレビューとディレクトリツリー、復元時は展開されるサブディレクトリ・ファイル一覧がここに表示されます。</span>
+  <div id="appRoot" class="app-shell">
+    <header class="app-header">
+      <div class="brand">
+        <div class="brand-mark" aria-hidden="true">▦</div>
+        <div class="brand-copy">
+          <p class="eyebrow">LOCAL FILE WORKSPACE</p>
+          <h1>Secure Gemini Code Packer</h1>
+          <p class="brand-description">プロジェクトをMarkdownにまとめる。必要なときは元の構造へ戻す。</p>
         </div>
-        <pre id="previewBox" class="test-box" hidden></pre>
       </div>
-
-      <p class="hint">
-        ※ サブディレクトリ階層と相対パス（例: <code>src/utils/helper.js</code>）はCRC-32検査値とともに厳密に保持・検証されます。
-      </p>
-    </section>
-
-    <!-- 右カラム：操作・設定・出力アクション -->
-    <aside class="panel" aria-labelledby="panelControlTitle">
-      <div class="panel-head">
-        <h2 id="panelControlTitle">操作・セキュリティ設定</h2>
+      <div class="header-actions">
+        <button id="btnSelfTest" class="button button-quiet" type="button">自己診断</button>
+        <button id="btnClearMemory" class="button button-quiet" type="button" disabled>メモリをクリア</button>
       </div>
+    </header>
 
-      <div class="controls">
-        <!-- 入力ソース選択 -->
-        <div class="field">
-          <span class="field-title">1. 入力ファイルを選択</span>
-          <div class="button-row">
-            <button id="btnSelectFolder" class="secondary" type="button">📁 フォルダ選択</button>
-            <button id="btnSelectZip" class="secondary" type="button">🗜️ ZIP選択</button>
-            <button id="btnSelectMd" class="secondary" type="button">🔄 .md から復元</button>
+    <nav class="workflow" aria-label="処理の流れ">
+      <div class="workflow-step"><span class="step-number">01</span><span><strong>読み込む</strong><small>フォルダ・ZIP・Markdown</small></span></div>
+      <span class="workflow-arrow" aria-hidden="true">→</span>
+      <div class="workflow-step"><span class="step-number">02</span><span><strong>確認する</strong><small>内容と機密情報を確認</small></span></div>
+      <span class="workflow-arrow" aria-hidden="true">→</span>
+      <div class="workflow-step"><span class="step-number">03</span><span><strong>保存・復元</strong><small>MarkdownまたはZIP</small></span></div>
+    </nav>
+
+    <main class="main-grid">
+      <section class="panel workspace-panel" aria-labelledby="inputHeading">
+        <div class="section-heading">
+          <div>
+            <p class="section-kicker">WORKSPACE</p>
+            <h2 id="inputHeading">ファイルを読み込む</h2>
           </div>
-          <div class="button-row">
-            <button id="btnCancel" class="subtle" type="button" disabled>🛑 処理を中断</button>
-          </div>
+          <span id="statBadge" class="status-badge">待機中</span>
         </div>
 
-        <!-- 機密検出モード設定 -->
-        <div class="field">
-          <div class="field-header">
-            <label for="secretModeSelect">機密パターン検出時の動作（Markdown生成時）</label>
-            <span class="badge">保護</span>
+        <div id="dropZone" class="file-zone" role="region" aria-label="ファイルのドラッグ＆ドロップ領域">
+          <div class="upload-symbol" aria-hidden="true">
+            <svg viewBox="0 0 48 48" focusable="false" aria-hidden="true">
+              <path d="M24 32V8m0 0-9 9m9-9 9 9M9 29v10a3 3 0 0 0 3 3h24a3 3 0 0 0 3-3V29" />
+            </svg>
           </div>
-          <select id="secretModeSelect">
-            <option value="skip" selected>ファイルごと安全に除外する（推奨）</option>
-            <option value="redact">該当箇所を [REDACTED] にマスクする</option>
+          <h3 id="dropTitle">ここにファイルまたはフォルダをドロップ</h3>
+          <p class="drop-description">フォルダ・ZIPはMarkdownへ変換、.md は元のディレクトリ構造へ復元します。</p>
+          <p class="drop-support">対応形式：フォルダ / .zip / .md / .markdown</p>
+
+          <div class="picker-actions" aria-label="ファイルを選択">
+            <button id="btnSelectFolder" class="button button-primary" type="button">
+              <span aria-hidden="true">▰</span> フォルダを選択
+            </button>
+            <button id="btnSelectZip" class="button button-secondary" type="button">
+              <span aria-hidden="true">▤</span> ZIPを選択
+            </button>
+            <button id="btnSelectMd" class="button button-secondary" type="button">
+              <span aria-hidden="true">↶</span> Markdownから復元
+            </button>
+          </div>
+          <p class="picker-note">ボタンからの選択も利用できます。フォルダ選択は対応ブラウザでご利用ください。</p>
+
+          <input type="file" id="folderInput" class="visually-hidden" webkitdirectory directory multiple aria-label="変換するフォルダを選択">
+          <input type="file" id="zipInput" class="visually-hidden" accept=".zip,application/zip" aria-label="変換するZIPファイルを選択">
+          <input type="file" id="mdRestoreInput" class="visually-hidden" accept=".md,.markdown,text/markdown,text/plain" aria-label="復元するMarkdownファイルを選択">
+        </div>
+
+        <div class="metadata-row">
+          <p id="metaInfo" class="meta">まだファイルが読み込まれていません。</p>
+          <button id="btnCancel" class="button button-danger-quiet" type="button" disabled>処理を中断</button>
+        </div>
+
+        <div class="preview-heading">
+          <div>
+            <p class="section-kicker">PREVIEW</p>
+            <h3>内容のプレビュー</h3>
+          </div>
+          <span class="preview-limit">先頭10,000文字を表示</span>
+        </div>
+        <div class="preview" aria-live="polite" aria-atomic="false">
+          <div id="emptyState" class="empty">
+            <span class="empty-icon" aria-hidden="true">⌁</span>
+            <strong>プレビューはここに表示されます</strong>
+            <span>読み込み後、ファイル構成や復元対象を確認できます。</span>
+          </div>
+          <pre id="previewBox" class="preview-content" hidden></pre>
+        </div>
+        <p class="hint">相対パスとサブディレクトリ階層を保持します。出力前に内容と機密情報を必ず確認してください。</p>
+      </section>
+
+      <aside class="panel settings-panel" aria-labelledby="settingsHeading">
+        <div class="section-heading">
+          <div>
+            <p class="section-kicker">SETTINGS &amp; EXPORT</p>
+            <h2 id="settingsHeading">設定と出力</h2>
+          </div>
+          <span class="security-label"><span aria-hidden="true">●</span> ローカル処理</span>
+        </div>
+
+        <div class="settings-group">
+          <label class="field-label" for="secretModeSelect">機密情報を検出したとき</label>
+          <select id="secretModeSelect" class="select-control">
+            <option value="skip" selected>ファイルごと除外する（推奨）</option>
+            <option value="redact">該当箇所を [REDACTED] に置換</option>
           </select>
-          <small>APIキー、秘密鍵、Bearerトークン、パスワード代入等を自動検査します。</small>
+          <p class="field-help">APIキー、秘密鍵、Bearerトークンなどを検査します。</p>
         </div>
 
-        <!-- 境界宣言オプション -->
-        <div class="field">
-          <label for="boundarySelect">プロンプトインジェクション対策</label>
-          <select id="boundarySelect">
-            <option value="on" selected>未信頼データ境界宣言を付与する（推奨）</option>
+        <div class="settings-group">
+          <label class="field-label" for="boundarySelect">AI向けの未信頼データ境界宣言</label>
+          <select id="boundarySelect" class="select-control">
+            <option value="on" selected>付与する（推奨）</option>
             <option value="off">付与しない</option>
           </select>
+          <p class="field-help">コード内の文章をAIへの指示と誤認しにくくします。</p>
         </div>
 
-        <!-- ステータス表示 -->
-        <div id="statusBox" class="status" role="status" aria-live="polite">
-          🛡️ 準備完了（外部通信なし・完全ローカル処理）
+        <div id="statusBox" class="status-message" role="status" aria-live="polite">
+          準備完了。ファイルを選択するか、ドロップしてください。
         </div>
 
-        <!-- 最終確認チェック -->
-        <div class="field">
-          <label for="confirmReviewedCheck">
+        <div class="review-box">
+          <label class="review-label" for="confirmReviewedCheck">
             <input type="checkbox" id="confirmReviewedCheck" disabled>
-            プレビュー内容（パス階層・機密有無）を確認しました
+            <span><strong>出力内容を確認しました</strong><small>パス階層・機密情報・除外対象を確認済み</small></span>
           </label>
         </div>
 
-        <!-- Markdown出力アクション -->
-        <div id="packActions" class="action-stack">
-          <button id="btnDownloadMd" class="primary" type="button" disabled>💾 Markdownファイルを保存 (.md)</button>
-          <button id="btnCopyMd" class="secondary" type="button" disabled>📋 Markdownをクリップボードにコピー</button>
-        </div>
-
-        <!-- ディレクトリ復元アクション -->
-        <div id="restoreActions" class="action-stack">
-          <button id="btnDownloadRestoredZip" class="primary" type="button" disabled>🗜️ 元のディレクトリ構造をZIPで保存 (.zip)</button>
-          <button id="btnWriteToFolder" class="secondary" type="button" disabled>📂 ローカルフォルダへ直接展開・復元</button>
-        </div>
-
-        <!-- 監査ログ・自己診断結果 -->
-        <div id="logSection" class="field" hidden>
-          <div class="field-header">
-            <span class="field-title">監査＆セキュリティログ</span>
-            <button id="btnClearLog" class="subtle" type="button">消去</button>
+        <div class="export-section">
+          <p class="section-kicker">MARKDOWN OUTPUT</p>
+          <div class="action-stack">
+            <button id="btnDownloadMd" class="button button-primary button-wide" type="button" disabled>Markdownファイルを保存</button>
+            <button id="btnCopyMd" class="button button-secondary button-wide" type="button" disabled>Markdownをコピー</button>
           </div>
-          <div id="logBox" class="test-box"></div>
         </div>
 
-        <div class="privacy">
-          <strong>双方向パス保全＆メモリ保護:</strong><br>
-          サブディレクトリ構造は相対パスとCRC-32マニフェストにより1バイトの狂いなく復元可能です。復元時はZip SlipやWindows予約名などの危険なパスを厳格に遮断します。
+        <div class="export-section">
+          <p class="section-kicker">DIRECTORY RESTORE</p>
+          <div class="action-stack">
+            <button id="btnDownloadRestoredZip" class="button button-primary button-wide" type="button" disabled>復元した構造をZIPで保存</button>
+            <button id="btnWriteToFolder" class="button button-secondary button-wide" type="button" disabled>ローカルフォルダへ展開</button>
+          </div>
+          <p class="field-help">直接展開は対応ブラウザが必要です。既存の同名フォルダを避けて新しいフォルダを作成します。</p>
         </div>
-      </div>
-    </aside>
-  </main>
 
-  <footer class="footer">
-    Secure Gemini Code Packer &amp; Restorer — Strict CSP / Round-Trip Verified / Zero External Dependencies
-  </footer>
-</div>
+        <section id="logSection" class="audit-section" hidden aria-labelledby="logHeading">
+          <div class="audit-heading">
+            <h3 id="logHeading">監査・処理ログ</h3>
+            <button id="btnClearLog" class="button button-text" type="button">消去</button>
+          </div>
+          <div id="logBox" class="audit-log" role="log" aria-live="polite"></div>
+        </section>
 
-<script src="./app.js"></script>
+        <div class="privacy-note">
+          <strong>プライバシーと安全性</strong>
+          <p>ファイルの解析・変換はブラウザ内で行い、外部サーバーへ送信しません。秘密情報検出はパターン照合のため、すべての機密情報を検出できる保証はありません。</p>
+        </div>
+      </aside>
+    </main>
+
+    <footer class="app-footer">
+      <span>Secure Gemini Code Packer</span>
+      <span>外部ライブラリ不使用・ブラウザ内処理</span>
+    </footer>
+  </div>
+  <script src="./app.js"></script>
 </body>
 </html>
